@@ -1,0 +1,48 @@
+# Секреты
+.env
+*.env
+!.env.example
+
+# База данных
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+.venv/
+env/
+ENV/
+*.egg-info/
+dist/
+build/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Логи
+*.log
+logs/
+
+# Backups
+backups/
+*.backup
+*.save
+phase0_essayist.py
+
+# SQLite database and WAL files (runtime artifacts)
+twidgest.db
+twidgest.db-shm
+twidgest.db-wal
+publish_log.jsonl
+*.jsonl
