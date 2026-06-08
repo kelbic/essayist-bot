@@ -97,6 +97,13 @@ CREATE TABLE IF NOT EXISTS essay_config (
     last_run_at     TEXT,
     last_error      TEXT
 );
+CREATE TABLE IF NOT EXISTS skipped_topics (
+    channel_id INTEGER NOT NULL,
+    tweet_id   TEXT NOT NULL,
+    reason     TEXT,
+    ts         TEXT,
+    PRIMARY KEY (channel_id, tweet_id)
+);
 CREATE INDEX IF NOT EXISTS idx_essay_config_user ON essay_config(user_id);
 CREATE INDEX IF NOT EXISTS idx_pending_owner ON pending_drafts(owner_user_id, status);
 """
@@ -362,3 +369,20 @@ class Store:
                 "SELECT channel_id, user_id, frequency_hours, mode, last_run_at "
                 "FROM essay_config WHERE enabled=1")).fetchall()
         return [dict(r) for r in rows]
+
+    # Пропущенные темы автоподбора (напр. непоисковые мемы) — чтобы таймер
+    # не возвращался к ним в следующих тиках.
+
+    async def mark_skipped(self, channel_id: int, tweet_id: str, reason: str) -> None:
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                "INSERT OR IGNORE INTO skipped_topics(channel_id, tweet_id, reason, ts) "
+                "VALUES(?,?,?,?)", (channel_id, tweet_id, reason, _now()))
+            await db.commit()
+
+    async def is_skipped(self, channel_id: int, tweet_id: str) -> bool:
+        async with aiosqlite.connect(self.db_path) as db:
+            row = await (await db.execute(
+                "SELECT 1 FROM skipped_topics WHERE channel_id=? AND tweet_id=? LIMIT 1",
+                (channel_id, tweet_id))).fetchone()
+        return row is not None

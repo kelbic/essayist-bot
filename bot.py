@@ -50,6 +50,7 @@ REASON_LABELS = {"fact": "факт-ошибка", "style": "стиль", "boring
 TICK_MINUTES = 30          # внутренний пульс таймера (не пользовательская настройка)
 DEFAULT_FREQ_HOURS = 12    # частота разбора по умолчанию для канала
 FRESH_HOURS = 24           # автоподбор берёт твиты не старше N часов (по queued_at)
+MAX_PICK_ATTEMPTS = 3      # сколько кандидатов пробовать за тик, прежде чем сдаться
 INTERVAL_CHOICES = (3, 6, 12, 24)
 
 NO_ACCESS_CHANNEL = "Нет доступа к этому каналу — он не твой."
@@ -71,6 +72,12 @@ def _bot_can_post(member) -> bool:
     if status == "administrator":
         return bool(getattr(member, "can_post_messages", False))
     return False
+
+
+def _is_unsearchable(res) -> bool:
+    """Сработал ли предохранитель «0 веб-поисков» (тему стоит пропустить навсегда),
+    в отличие от транзиентного сбоя API (тему можно ретраить)."""
+    return bool(res and res.error and "поиск" in res.error.lower())
 
 
 def _is_due(last_run_at: str | None, frequency_hours: int, now: datetime | None = None) -> bool:
@@ -517,7 +524,7 @@ async def _timer_send(bot: Bot, chat_id: int, cand, owner_user_id: int) -> bool:
                                channel=cand.title, api_key=ANTHROPIC_KEY)
     if not res.ok:
         log.warning("timer: генерация не удалась «%s»: %s", cand.title, res.error)
-        return False
+        return False, res
     did = await st.create_draft(
         channel_id=cand.channel_id, owner_user_id=owner_user_id, tweet_id=cand.tweet_id,
         tweet_text=cand.text, author=cand.author, niche=cand.niche,
@@ -528,7 +535,7 @@ async def _timer_send(bot: Bot, chat_id: int, cand, owner_user_id: int) -> bool:
         await bot.send_message(chat_id, ch)
     await bot.send_message(chat_id, _card(cand.title, cand.author, cand.niche, res),
                            reply_markup=_kb_main(did))
-    return True
+    return True, res
 
 
 async def run_timer_tick(bot: Bot) -> None:
@@ -553,13 +560,18 @@ async def run_timer_tick(bot: Bot) -> None:
         except Exception:
             log.exception("timer: кандидаты не прочитались для %s", cid)
             continue
-        pick = None
+        eligible = []
         for c in cands:
-            if c.target_chat_id and not await st.seen_tweet(c.channel_id, c.tweet_id):
-                pick = c
-                break
-        if not pick:
-            continue  # свежих тем нет — ждём следующего тика, ничего не тратим
+            if not c.target_chat_id:
+                continue
+            if await st.seen_tweet(c.channel_id, c.tweet_id):
+                continue
+            if await st.is_skipped(c.channel_id, c.tweet_id):
+                continue
+            eligible.append(c)
+        if not eligible:
+            continue  # свежих новых тем нет — ждём следующего тика, ничего не тратим
+        # предохранитель доставки (один раз на канал, до генерации)
         try:
             await bot.send_chat_action(owner, "typing")
         except Exception as exc:
@@ -570,13 +582,30 @@ async def run_timer_tick(bot: Bot) -> None:
             log.warning("timer: владелец %s недоступен (канал %s): %s", owner, cid, msg)
             await st.set_essay_error(cid, msg)
             continue
-        if await _timer_send(bot, owner, pick, owner):
+        # пробуем до MAX_PICK_ATTEMPTS кандидатов: непоисковые метим skip и идём дальше
+        delivered = False
+        stop_transient = False
+        for c in eligible[:MAX_PICK_ATTEMPTS]:
+            ok, res = await _timer_send(bot, owner, c, owner)
+            if ok:
+                await st.touch_essay_run(cid)
+                await st.set_essay_error(cid, None)
+                log.info("timer: канал %s, владелец %s, тема @%s", cid, owner, c.author)
+                delivered = True
+                break
+            if _is_unsearchable(res):
+                await st.mark_skipped(cid, c.tweet_id, "0 веб-поисков (непоисковая тема)")
+                log.info("timer: канал %s — @%s непоисковая (0 поисков), пробую следующую", cid, c.author)
+                continue
+            # транзиентная ошибка генерации — тему НЕ метим, прекращаем тик, ретрай позже
             await st.touch_essay_run(cid)
-            await st.set_essay_error(cid, None)
-        else:
+            await st.set_essay_error(cid, f"генерация: {(res.error if res else 'сбой')[:80]}")
+            log.warning("timer: канал %s — транзиентный сбой генерации, ретрай позже", cid)
+            stop_transient = True
+            break
+        if not delivered and not stop_transient:
             await st.touch_essay_run(cid)
-            await st.set_essay_error(cid, "генерация не удалась (см. лог)")
-        log.info("timer: канал %s, владелец %s, тема @%s", cid, owner, pick.author)
+            await st.set_essay_error(cid, "подряд непоисковые темы — пропуск тика")
 
 
 async def timer_loop(bot: Bot) -> None:
