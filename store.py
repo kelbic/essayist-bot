@@ -90,7 +90,8 @@ CREATE TABLE IF NOT EXISTS essay_config (
     enabled         INTEGER NOT NULL DEFAULT 0,   -- ОПТ-ИН: по умолчанию выкл
     frequency_hours INTEGER NOT NULL DEFAULT 12,
     mode            TEXT NOT NULL DEFAULT 'hil',  -- hil | auto
-    last_run_at     TEXT
+    last_run_at     TEXT,
+    last_error      TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_essay_config_user ON essay_config(user_id);
 CREATE INDEX IF NOT EXISTS idx_pending_owner ON pending_drafts(owner_user_id, status);
@@ -108,16 +109,24 @@ class Store:
         async with aiosqlite.connect(self.db_path) as db:
             await db.executescript(_SCHEMA)
             await db.executescript(_SETTINGS_SCHEMA)
-            await self._migrate(db)          # дотягиваем старую БД до новой схемы
+            await self._migrate_pending(db)  # owner_user_id в старой pending_drafts
             await db.executescript(_TENANT_SCHEMA)
+            await self._migrate_tenant(db)   # last_error в старой essay_config
             await db.commit()
 
-    async def _migrate(self, db) -> None:
-        """Идемпотентные миграции для уже существующих essayist.db."""
+    async def _migrate_pending(self, db) -> None:
+        """Идемпотентно: owner_user_id в уже существующей pending_drafts."""
         cur = await db.execute("PRAGMA table_info(pending_drafts)")
         cols = {r[1] for r in await cur.fetchall()}
         if "owner_user_id" not in cols:
             await db.execute("ALTER TABLE pending_drafts ADD COLUMN owner_user_id INTEGER")
+
+    async def _migrate_tenant(self, db) -> None:
+        """Идемпотентно: last_error в уже существующей essay_config."""
+        cur = await db.execute("PRAGMA table_info(essay_config)")
+        cols = {r[1] for r in await cur.fetchall()}
+        if "last_error" not in cols:
+            await db.execute("ALTER TABLE essay_config ADD COLUMN last_error TEXT")
 
     async def create_draft(self, *, channel_id, tweet_id, tweet_text, author, niche,
                            target_chat_id, title, brief, draft, violations,
@@ -317,6 +326,13 @@ class Store:
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute("UPDATE essay_config SET last_run_at=? WHERE channel_id=?",
                              (_now(), channel_id))
+            await db.commit()
+
+    async def set_essay_error(self, channel_id: int, error: str | None) -> None:
+        """Отметка последней ошибки доставки (None — очистить). Для /timer-диагностики."""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("UPDATE essay_config SET last_error=? WHERE channel_id=?",
+                             (error, channel_id))
             await db.commit()
 
     async def enabled_essay_channels(self) -> list[dict]:

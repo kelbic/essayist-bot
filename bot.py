@@ -4,7 +4,8 @@
 Своя БД (store.py). Постит своим токеном в target_chat_id канала владельца.
 
 Мультитенант (вариант B): доступ через auth.py — суперадмин → допуск (Essayist Pro)
-→ владение каналом. Владелец читается из twidgest read-only; допуск — в своей БД.
+→ владение каналом. Таймер ходит по per-channel essay_config (opt-in, по умолчанию
+выкл), уважает frequency_hours/last_run_at и шлёт карточку ВЛАДЕЛЬЦУ канала.
 """
 from __future__ import annotations
 
@@ -12,6 +13,7 @@ import asyncio
 import logging
 import os
 import time
+from datetime import datetime, timezone
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandObject
@@ -43,7 +45,8 @@ dp = Dispatcher()
 
 TG_LIMIT = 4000
 REASON_LABELS = {"fact": "факт-ошибка", "style": "стиль", "boring": "не интересно", "other": "другое"}
-DEFAULT_TIMER_HOURS = 6
+TICK_MINUTES = 30          # внутренний пульс таймера (не пользовательская настройка)
+DEFAULT_FREQ_HOURS = 12    # частота разбора по умолчанию для канала
 INTERVAL_CHOICES = (3, 6, 12, 24)
 
 NO_ACCESS_CHANNEL = "Нет доступа к этому каналу — он не твой."
@@ -53,6 +56,20 @@ NO_PRO = "Доступ к Essayist Pro не активирован. Обрати
 
 def _is_admin(uid: int) -> bool:
     return ADMIN != 0 and uid == ADMIN
+
+
+def _is_due(last_run_at: str | None, frequency_hours: int, now: datetime | None = None) -> bool:
+    """Пора ли каналу новый разбор: никогда не запускался ИЛИ прошло >= frequency_hours."""
+    if not last_run_at:
+        return True
+    now = now or datetime.now(timezone.utc)
+    try:
+        last = datetime.fromisoformat(last_run_at)
+    except ValueError:
+        return True
+    if last.tzinfo is None:
+        last = last.replace(tzinfo=timezone.utc)
+    return (now - last).total_seconds() >= frequency_hours * 3600
 
 
 async def _resolve_channel(uid: int, channel_id: int):
@@ -278,7 +295,7 @@ async def cb_angle(cq: CallbackQuery) -> None:
     res = await generate_essay(tweet_text=d.tweet_text, author=d.author, niche=d.niche,
                                channel=d.title, api_key=ANTHROPIC_KEY)
     if not res.ok:
-        await st.apply_revision(did, d.draft, d.violations)  # вернуть как было, статус pending
+        await st.apply_revision(did, d.draft, d.violations)
         return await cq.message.answer(f"⚠️ Перегенерация не вышла: {res.error}")
     await st.apply_revision(did, res.draft, res.violations)
     await cq.message.answer(f"🔁 Заход №{d.revision_count + 1}:")
@@ -325,20 +342,33 @@ async def cb_reason(cq: CallbackQuery) -> None:
     await cq.answer("Записал")
 
 
-async def _settings_panel() -> tuple[str, InlineKeyboardMarkup]:
-    hours = await st.get_setting("timer_hours", str(DEFAULT_TIMER_HOURS))
-    chans = await candidates.list_channels(TWIDGEST_DB)
-    disabled = await st.disabled_channels()
-    rows = []
+async def _timer_panel(uid: int) -> tuple[str, InlineKeyboardMarkup]:
+    """Панель автоподбора: суперадмин видит все каналы, юзер — свои.
+
+    Вкл/выкл и частота — per-channel (essay_config). По умолчанию канал выключен.
+    """
+    chans = await auth.visible_channels(st, TWIDGEST_DB, uid, ADMIN)
+    rows, notes = [], []
     for c in chans:
-        on = c.channel_id not in disabled
-        rows.append([InlineKeyboardButton(text=f"{'\u2705' if on else '\U0001f6ab'} {c.title}",
-                                          callback_data=f"chtoggle:{c.channel_id}")])
-    rows.append([InlineKeyboardButton(text=f"{'\u2022 ' if str(h) == str(hours) else ''}{h}\u0447",
-                                      callback_data=f"setint:{h}") for h in INTERVAL_CHOICES])
-    text = (f"\u23f1 \u0410\u0432\u0442\u043e\u043f\u043e\u0434\u0431\u043e\u0440 \u0442\u0435\u043c\n"
-            f"\u0418\u043d\u0442\u0435\u0440\u0432\u0430\u043b: \u043a\u0430\u0436\u0434\u044b\u0435 {hours} \u0447\n\n"
-            "\u041a\u0430\u043d\u0430\u043b\u044b (\u2705 \u0432\u043a\u043b / \U0001f6ab \u0432\u044b\u043a\u043b) \u2014 \u043d\u0430\u0436\u043c\u0438, \u0447\u0442\u043e\u0431\u044b \u043f\u0435\u0440\u0435\u043a\u043b\u044e\u0447\u0438\u0442\u044c:")
+        cfg = await st.get_essay_config(c.channel_id)
+        on = bool(cfg and cfg["enabled"])
+        freq = cfg["frequency_hours"] if cfg else DEFAULT_FREQ_HOURS
+        mark = "✅" if on else "🚫"
+        rows.append([InlineKeyboardButton(text=f"{mark} {c.title}",
+                                          callback_data=f"estog:{c.channel_id}")])
+        rows.append([InlineKeyboardButton(text=f"{'• ' if h == freq else ''}{h}ч",
+                                          callback_data=f"esfreq:{c.channel_id}:{h}")
+                     for h in INTERVAL_CHOICES])
+        if on and cfg and cfg.get("last_error"):
+            notes.append(f"⚠️ «{c.title}»: {cfg['last_error']}")
+    if not rows:
+        return ("У тебя нет подключённых каналов для Essayist Pro.",
+                InlineKeyboardMarkup(inline_keyboard=[]))
+    text = ("⏱ Автоподбор разборов\n\n"
+            f"Проверка каждые {TICK_MINUTES} мин; частота ниже — как часто канал получает разбор.\n"
+            "✅ вкл / 🚫 выкл — нажми на название канала.")
+    if notes:
+        text += "\n\n" + "\n".join(notes)
     return text, InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -351,85 +381,109 @@ async def _safe_edit(message: Message, text: str, kb: InlineKeyboardMarkup) -> N
 
 @dp.message(Command("timer"))
 async def cmd_timer(message: Message, command: CommandObject) -> None:
-    if not _is_admin(message.from_user.id):
+    uid = message.from_user.id
+    if not await auth.is_entitled(st, uid, ADMIN):
+        await message.answer(NO_PRO)
         return
-    text, kb = await _settings_panel()
+    text, kb = await _timer_panel(uid)
     await message.answer(text, reply_markup=kb)
 
 
-@dp.callback_query(F.data.startswith("chtoggle:"))
-async def cb_chtoggle(cq: CallbackQuery) -> None:
-    if not _is_admin(cq.from_user.id):
-        return await cq.answer()
+@dp.callback_query(F.data.startswith("estog:"))
+async def cb_estog(cq: CallbackQuery) -> None:
+    uid = cq.from_user.id
     cid = int(cq.data.split(":")[1])
-    disabled = await st.disabled_channels()
-    await st.set_channel_enabled(cid, cid in disabled)
-    text, kb = await _settings_panel()
+    ch, allowed = await _resolve_channel(uid, cid)
+    if not ch or not allowed:
+        return await cq.answer(NO_ACCESS_CHANNEL, show_alert=True)
+    cfg = await st.get_essay_config(cid)
+    now_on = bool(cfg and cfg["enabled"])
+    await st.set_essay_enabled(cid, ch.user_id, not now_on)
+    text, kb = await _timer_panel(uid)
     await _safe_edit(cq.message, text, kb)
-    await cq.answer()
+    await cq.answer("Включён" if not now_on else "Выключен")
 
 
-@dp.callback_query(F.data.startswith("setint:"))
-async def cb_setint(cq: CallbackQuery) -> None:
-    if not _is_admin(cq.from_user.id):
-        return await cq.answer()
-    hours = cq.data.split(":")[1]
-    await st.set_setting("timer_hours", hours)
-    text, kb = await _settings_panel()
+@dp.callback_query(F.data.startswith("esfreq:"))
+async def cb_esfreq(cq: CallbackQuery) -> None:
+    uid = cq.from_user.id
+    _, scid, sh = cq.data.split(":", 2)
+    cid, hours = int(scid), int(sh)
+    ch, allowed = await _resolve_channel(uid, cid)
+    if not ch or not allowed:
+        return await cq.answer(NO_ACCESS_CHANNEL, show_alert=True)
+    await st.set_essay_frequency(cid, ch.user_id, hours)
+    text, kb = await _timer_panel(uid)
     await _safe_edit(cq.message, text, kb)
-    await cq.answer(f"\u0418\u043d\u0442\u0435\u0440\u0432\u0430\u043b: {hours} \u0447")
+    await cq.answer(f"Частота: {hours} ч")
 
 
-async def _timer_send(bot: Bot, chat_id: int, cand) -> None:
+async def _timer_send(bot: Bot, chat_id: int, cand, owner_user_id: int) -> bool:
+    """Сгенерировать разбор и отправить карточку владельцу. True если карточка ушла."""
     res = await generate_essay(tweet_text=cand.text, author=cand.author, niche=cand.niche,
                                channel=cand.title, api_key=ANTHROPIC_KEY)
     if not res.ok:
-        await bot.send_message(chat_id, f"\u26a0\ufe0f \u0410\u0432\u0442\u043e\u043f\u043e\u0434\u0431\u043e\u0440 \u00ab{cand.title}\u00bb: {res.error}")
-        return
+        log.warning("timer: генерация не удалась «%s»: %s", cand.title, res.error)
+        return False
     did = await st.create_draft(
-        channel_id=cand.channel_id, tweet_id=cand.tweet_id, tweet_text=cand.text,
-        author=cand.author, niche=cand.niche, target_chat_id=cand.target_chat_id,
-        title=cand.title, brief=res.brief, draft=res.draft, violations=res.violations,
-        total_searches=res.total_searches)
-    await bot.send_message(chat_id, f"\u23f1 \u0410\u0432\u0442\u043e\u043f\u043e\u0434\u0431\u043e\u0440 \u00b7 \u00ab{cand.title}\u00bb \u00b7 \u0442\u0435\u043c\u0430 @{cand.author}")
+        channel_id=cand.channel_id, owner_user_id=owner_user_id, tweet_id=cand.tweet_id,
+        tweet_text=cand.text, author=cand.author, niche=cand.niche,
+        target_chat_id=cand.target_chat_id, title=cand.title, brief=res.brief,
+        draft=res.draft, violations=res.violations, total_searches=res.total_searches)
+    await bot.send_message(chat_id, f"⏱ Автоподбор · «{cand.title}» · тема @{cand.author}")
     for ch in _chunks(res.draft):
         await bot.send_message(chat_id, ch)
     await bot.send_message(chat_id, _card(cand.title, cand.author, cand.niche, res),
                            reply_markup=_kb_main(did))
+    return True
 
 
 async def run_timer_tick(bot: Bot) -> None:
     try:
-        chans = await candidates.list_channels(TWIDGEST_DB)
+        rows = await st.enabled_essay_channels()
     except Exception:
-        log.exception("timer: read channels failed")
+        log.exception("timer: чтение essay_config не удалось")
         return
-    disabled = await st.disabled_channels()
-    for ch in chans:
-        if ch.channel_id in disabled:
+    now = datetime.now(timezone.utc)
+    for cfg in rows:
+        cid = cfg["channel_id"]
+        owner = cfg["user_id"]
+        if not _is_due(cfg.get("last_run_at"), cfg.get("frequency_hours", DEFAULT_FREQ_HOURS), now):
             continue
         try:
-            cands = await candidates.top_candidates(TWIDGEST_DB, ch.channel_id, limit=10)
+            ch = await candidates.get_channel(TWIDGEST_DB, cid)
+            if not ch or not ch.target_chat_id:
+                await st.set_essay_error(cid, "канал пропал из twidgest или без target_chat_id")
+                continue
+            cands = await candidates.top_candidates(TWIDGEST_DB, cid, limit=10)
         except Exception:
-            log.exception("timer: candidates failed for %s", ch.channel_id)
+            log.exception("timer: кандидаты не прочитались для %s", cid)
             continue
         pick = None
         for c in cands:
             if c.target_chat_id and not await st.seen_tweet(c.channel_id, c.tweet_id):
                 pick = c
                 break
-        if pick:
-            log.info("timer: channel %s topic @%s", ch.channel_id, pick.author)
-            await _timer_send(bot, ADMIN, pick)
+        if not pick:
+            continue  # свежих тем нет — ждём следующего тика, ничего не тратим
+        try:
+            await bot.send_chat_action(owner, "typing")
+        except Exception as exc:
+            log.warning("timer: владелец %s недоступен (канал %s): %s", owner, cid, exc)
+            await st.set_essay_error(cid, f"не доставить владельцу (нажал ли он Start у бота?): {exc}")
+            continue
+        if await _timer_send(bot, owner, pick, owner):
+            await st.touch_essay_run(cid)
+            await st.set_essay_error(cid, None)
+        else:
+            await st.touch_essay_run(cid)
+            await st.set_essay_error(cid, "генерация не удалась (см. лог)")
+        log.info("timer: канал %s, владелец %s, тема @%s", cid, owner, pick.author)
 
 
 async def timer_loop(bot: Bot) -> None:
     while True:
-        try:
-            hours = float(await st.get_setting("timer_hours", str(DEFAULT_TIMER_HOURS)))
-        except (TypeError, ValueError):
-            hours = float(DEFAULT_TIMER_HOURS)
-        await asyncio.sleep(max(0.5, hours) * 3600)
+        await asyncio.sleep(TICK_MINUTES * 60)
         try:
             await run_timer_tick(bot)
         except Exception:
@@ -447,10 +501,10 @@ async def main() -> None:
     asyncio.create_task(timer_loop(bot))
     await bot.set_my_commands([
         BotCommand(command="essay", description="Разбор: выбрать тему канала — /essay <id> [all]"),
-        BotCommand(command="timer", description="Автоподбор: интервал и каналы вкл/выкл"),
+        BotCommand(command="timer", description="Автоподбор: вкл/выкл и частота по каналам"),
     ])
-    log.info("essayist-bot запущен; админ=%s, twidgest_db=%s, таймер=%s ч",
-             ADMIN, TWIDGEST_DB, DEFAULT_TIMER_HOURS)
+    log.info("essayist-bot запущен; админ=%s, twidgest_db=%s, тик=%s мин",
+             ADMIN, TWIDGEST_DB, TICK_MINUTES)
     await dp.start_polling(bot)
 
 
