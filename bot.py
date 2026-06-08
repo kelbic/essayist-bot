@@ -47,6 +47,7 @@ TG_LIMIT = 4000
 REASON_LABELS = {"fact": "факт-ошибка", "style": "стиль", "boring": "не интересно", "other": "другое"}
 TICK_MINUTES = 30          # внутренний пульс таймера (не пользовательская настройка)
 DEFAULT_FREQ_HOURS = 12    # частота разбора по умолчанию для канала
+FRESH_HOURS = 24           # автоподбор берёт твиты не старше N часов (по queued_at)
 INTERVAL_CHOICES = (3, 6, 12, 24)
 
 NO_ACCESS_CHANNEL = "Нет доступа к этому каналу — он не твой."
@@ -455,7 +456,8 @@ async def run_timer_tick(bot: Bot) -> None:
             if not ch or not ch.target_chat_id:
                 await st.set_essay_error(cid, "канал пропал из twidgest или без target_chat_id")
                 continue
-            cands = await candidates.top_candidates(TWIDGEST_DB, cid, limit=10)
+            cands = await candidates.top_candidates(TWIDGEST_DB, cid, limit=10,
+                                                    max_age_hours=FRESH_HOURS)
         except Exception:
             log.exception("timer: кандидаты не прочитались для %s", cid)
             continue
