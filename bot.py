@@ -1,7 +1,10 @@
 """Essayist HIL-бот: /essay <channel_id> → разбор → карточка с кнопками → публикация.
 
 Отдельный процесс, свой токен. База twidgest — только на чтение (candidates.py).
-Своя БД (store.py). Постит своим токеном в target_chat_id канала-витрины.
+Своя БД (store.py). Постит своим токеном в target_chat_id канала владельца.
+
+Мультитенант (вариант B): доступ через auth.py — суперадмин → допуск (Essayist Pro)
+→ владение каналом. Владелец читается из twidgest read-only; допуск — в своей БД.
 """
 from __future__ import annotations
 
@@ -21,6 +24,7 @@ from aiogram.types import (
 )
 from dotenv import load_dotenv
 
+import auth
 import candidates
 import store
 from essayist import generate_essay
@@ -42,9 +46,40 @@ REASON_LABELS = {"fact": "факт-ошибка", "style": "стиль", "boring
 DEFAULT_TIMER_HOURS = 6
 INTERVAL_CHOICES = (3, 6, 12, 24)
 
+NO_ACCESS_CHANNEL = "Нет доступа к этому каналу — он не твой."
+NO_ACCESS_DRAFT = "Нет доступа к этому черновику."
+NO_PRO = "Доступ к Essayist Pro не активирован. Обратись к администратору."
+
 
 def _is_admin(uid: int) -> bool:
     return ADMIN != 0 and uid == ADMIN
+
+
+async def _resolve_channel(uid: int, channel_id: int):
+    """(ch, allowed): ChannelInfo из twidgest + право доступа.
+
+    ch=None если канала нет. allowed=True если суперадмин ИЛИ (допущен И владелец).
+    """
+    ch = await candidates.get_channel(TWIDGEST_DB, channel_id)
+    if not ch:
+        return None, False
+    allowed = auth.is_superadmin(uid, ADMIN) or (
+        await st.user_enabled(uid) and ch.user_id == uid)
+    return ch, allowed
+
+
+async def _owns_draft(uid: int, did: int):
+    """(d, allowed): черновик + право им управлять.
+
+    Суперадмин — всегда. Иначе только владелец черновика. Старые черновики с
+    owner_user_id=NULL (до миграции) доступны только суперадмину.
+    """
+    d = await st.get(did)
+    if not d:
+        return None, False
+    allowed = auth.is_superadmin(uid, ADMIN) or (
+        d.owner_user_id is not None and d.owner_user_id == uid)
+    return d, allowed
 
 
 def _chunks(text: str, size: int = TG_LIMIT) -> list[str]:
@@ -94,13 +129,15 @@ def _card(cand_title: str, author: str | None, niche: str, res) -> str:
 
 @dp.message(Command("essay"))
 async def cmd_essay(message: Message, command: CommandObject) -> None:
-    if not _is_admin(message.from_user.id):
+    uid = message.from_user.id
+    if not await auth.is_entitled(st, uid, ADMIN):
+        await message.answer(NO_PRO)
         return
     arg = (command.args or "").strip()
     if not arg:
-        chans = await candidates.list_channels(TWIDGEST_DB)
+        chans = await auth.visible_channels(st, TWIDGEST_DB, uid, ADMIN)
         if not chans:
-            await message.answer("Каналов с заданным target_chat_id не найдено.")
+            await message.answer("У тебя нет подключённых каналов.")
             return
         lines = "\n".join(f"  /essay {c.channel_id} — {c.title} ({c.niche})" for c in chans)
         await message.answer("Укажи канал:\n" + lines)
@@ -111,15 +148,21 @@ async def cmd_essay(message: Message, command: CommandObject) -> None:
     except ValueError:
         await message.answer("Формат: /essay <channel_id> [all | своя тема или ссылка]")
         return
+
+    ch, allowed = await _resolve_channel(uid, channel_id)
+    if not ch or not ch.target_chat_id:
+        await message.answer("Канал не найден или без target_chat_id.")
+        return
+    if not allowed:
+        await message.answer(NO_ACCESS_CHANNEL)
+        return
+    owner = ch.user_id
+
     rest = parts[1].strip() if len(parts) > 1 else ""
     show_all = rest.lower() == "all"
     custom = "" if (not rest or show_all) else rest.strip(' "«»')
 
     if custom:
-        ch = await candidates.get_channel(TWIDGEST_DB, channel_id)
-        if not ch or not ch.target_chat_id:
-            await message.answer("Канал не найден или без target_chat_id.")
-            return
         await message.answer(f"🔎 Генерирую разбор по своей теме (ниша: {ch.niche})… ~минуту.")
         res = await generate_essay(tweet_text=custom, author=None, niche=ch.niche,
                                    channel=ch.title, api_key=ANTHROPIC_KEY)
@@ -127,7 +170,8 @@ async def cmd_essay(message: Message, command: CommandObject) -> None:
             await message.answer(f"⚠️ Не получилось: {res.error}")
             return
         did = await st.create_draft(
-            channel_id=channel_id, tweet_id=f"custom:{int(time.time())}", tweet_text=custom,
+            channel_id=channel_id, owner_user_id=owner,
+            tweet_id=f"custom:{int(time.time())}", tweet_text=custom,
             author=None, niche=ch.niche, target_chat_id=ch.target_chat_id, title=ch.title,
             brief=res.brief, draft=res.draft, violations=res.violations,
             total_searches=res.total_searches)
@@ -164,14 +208,18 @@ async def cmd_essay(message: Message, command: CommandObject) -> None:
 
 @dp.callback_query(F.data.startswith("pick:"))
 async def cb_pick(cq: CallbackQuery) -> None:
-    if not _is_admin(cq.from_user.id):
-        return await cq.answer()
+    uid = cq.from_user.id
     _, sch, tweet_id = cq.data.split(":", 2)
-    cand = await candidates.get_by_tweet(TWIDGEST_DB, int(sch), tweet_id)
+    channel_id = int(sch)
+    ch, allowed = await _resolve_channel(uid, channel_id)
+    if not allowed:
+        return await cq.answer(NO_ACCESS_CHANNEL, show_alert=True)
+    cand = await candidates.get_by_tweet(TWIDGEST_DB, channel_id, tweet_id)
     if not cand:
         return await cq.answer("Кандидат не найден (очередь обновилась).", show_alert=True)
     if not cand.target_chat_id:
         return await cq.answer("У канала нет target_chat_id.", show_alert=True)
+    owner = ch.user_id
     await cq.answer("Запускаю генерацию…")
     await cq.message.edit_text(f"🔎 Генерирую разбор по @{cand.author} (ниша: {cand.niche})… ~минуту.")
     res = await generate_essay(tweet_text=cand.text, author=cand.author, niche=cand.niche,
@@ -180,23 +228,24 @@ async def cb_pick(cq: CallbackQuery) -> None:
         await cq.message.answer(f"⚠️ Не получилось: {res.error}")
         return
     did = await st.create_draft(
-        channel_id=cand.channel_id, tweet_id=cand.tweet_id, tweet_text=cand.text,
-        author=cand.author, niche=cand.niche, target_chat_id=cand.target_chat_id,
-        title=cand.title, brief=res.brief, draft=res.draft, violations=res.violations,
-        total_searches=res.total_searches)
-    for ch in _chunks(res.draft):
-        await cq.message.answer(ch)
+        channel_id=cand.channel_id, owner_user_id=owner, tweet_id=cand.tweet_id,
+        tweet_text=cand.text, author=cand.author, niche=cand.niche,
+        target_chat_id=cand.target_chat_id, title=cand.title, brief=res.brief,
+        draft=res.draft, violations=res.violations, total_searches=res.total_searches)
+    for ch_text in _chunks(res.draft):
+        await cq.message.answer(ch_text)
     await cq.message.answer(_card(cand.title, cand.author, cand.niche, res),
                             reply_markup=_kb_main(did))
 
 
 @dp.callback_query(F.data.startswith("pub:"))
 async def cb_pub(cq: CallbackQuery) -> None:
-    if not _is_admin(cq.from_user.id):
-        return await cq.answer()
+    uid = cq.from_user.id
     did = int(cq.data.split(":")[1])
-    d = await st.get(did)
-    if not d or not d.target_chat_id:
+    d, allowed = await _owns_draft(uid, did)
+    if not allowed:
+        return await cq.answer(NO_ACCESS_DRAFT, show_alert=True)
+    if not d.target_chat_id:
         return await cq.answer("Нет таргета для публикации.", show_alert=True)
     if not await st.claim_for_publish(did):
         return await cq.answer("Уже опубликовано или в процессе.", show_alert=True)
@@ -217,9 +266,11 @@ async def cb_pub(cq: CallbackQuery) -> None:
 
 @dp.callback_query(F.data.startswith("angle:"))
 async def cb_angle(cq: CallbackQuery) -> None:
-    if not _is_admin(cq.from_user.id):
-        return await cq.answer()
+    uid = cq.from_user.id
     did = int(cq.data.split(":")[1])
+    _, allowed = await _owns_draft(uid, did)
+    if not allowed:
+        return await cq.answer(NO_ACCESS_DRAFT, show_alert=True)
     if not await st.begin_revision(did):
         return await cq.answer("Сейчас нельзя (уже опубликовано/отклонено).", show_alert=True)
     d = await st.get(did)
@@ -238,29 +289,36 @@ async def cb_angle(cq: CallbackQuery) -> None:
 
 @dp.callback_query(F.data.startswith("rej:"))
 async def cb_rej(cq: CallbackQuery) -> None:
-    if not _is_admin(cq.from_user.id):
-        return await cq.answer()
+    uid = cq.from_user.id
     did = int(cq.data.split(":")[1])
+    _, allowed = await _owns_draft(uid, did)
+    if not allowed:
+        return await cq.answer(NO_ACCESS_DRAFT, show_alert=True)
     await cq.message.edit_reply_markup(reply_markup=_kb_reasons(did))
     await cq.answer("Почему отклоняешь?")
 
 
 @dp.callback_query(F.data.startswith("back:"))
 async def cb_back(cq: CallbackQuery) -> None:
-    if not _is_admin(cq.from_user.id):
-        return await cq.answer()
+    uid = cq.from_user.id
     did = int(cq.data.split(":")[1])
+    _, allowed = await _owns_draft(uid, did)
+    if not allowed:
+        return await cq.answer(NO_ACCESS_DRAFT, show_alert=True)
     await cq.message.edit_reply_markup(reply_markup=_kb_main(did))
     await cq.answer()
 
 
 @dp.callback_query(F.data.startswith("reason:"))
 async def cb_reason(cq: CallbackQuery) -> None:
-    if not _is_admin(cq.from_user.id):
-        return await cq.answer()
+    uid = cq.from_user.id
     _, sid, code = cq.data.split(":", 2)
+    did = int(sid)
+    _, allowed = await _owns_draft(uid, did)
+    if not allowed:
+        return await cq.answer(NO_ACCESS_DRAFT, show_alert=True)
     reason = REASON_LABELS.get(code, "другое")
-    if not await st.reject(int(sid), reason):
+    if not await st.reject(did, reason):
         return await cq.answer("Сейчас нельзя.", show_alert=True)
     await cq.message.edit_reply_markup(reply_markup=None)
     await cq.message.answer(f"❌ Отклонено: {reason}")
