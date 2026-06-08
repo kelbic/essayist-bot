@@ -23,6 +23,7 @@ class Candidate:
 @dataclass
 class ChannelInfo:
     channel_id: int
+    user_id: int            # владелец канала в twidgest (tg_user_id) — для проверки прав
     title: str
     niche: str
     target_chat_id: int | None
@@ -44,12 +45,30 @@ def _row_to_candidate(r) -> Candidate:
                      tweet_id=r[4], author=r[5], text=r[6], url=r[7], likes=r[8], retweets=r[9])
 
 
+# Колонки канала в едином порядке — один _row_to_channel на все запросы.
+_CH_COLS = "id, user_id, title, niche, target_chat_id"
+
+
+def _row_to_channel(r) -> ChannelInfo:
+    return ChannelInfo(channel_id=r[0], user_id=r[1], title=r[2], niche=r[3], target_chat_id=r[4])
+
+
 async def list_channels(db_path: str) -> list[ChannelInfo]:
-    sql = ("SELECT id, title, niche, target_chat_id FROM channels "
+    """Все активные каналы (полный список — только для суперадмина)."""
+    sql = (f"SELECT {_CH_COLS} FROM channels "
            "WHERE is_active = 1 AND target_chat_id IS NOT NULL ORDER BY id")
     async with aiosqlite.connect(_ro_uri(db_path), uri=True) as db:
         rows = await (await db.execute(sql)).fetchall()
-    return [ChannelInfo(r[0], r[1], r[2], r[3]) for r in rows]
+    return [_row_to_channel(r) for r in rows]
+
+
+async def channels_for_user(db_path: str, user_id: int) -> list[ChannelInfo]:
+    """Только каналы, которыми владеет конкретный пользователь twidgest."""
+    sql = (f"SELECT {_CH_COLS} FROM channels "
+           "WHERE user_id = ? AND is_active = 1 AND target_chat_id IS NOT NULL ORDER BY id")
+    async with aiosqlite.connect(_ro_uri(db_path), uri=True) as db:
+        rows = await (await db.execute(sql, (user_id,))).fetchall()
+    return [_row_to_channel(r) for r in rows]
 
 
 async def top_candidates(db_path: str, channel_id: int, limit: int = 5) -> list[Candidate]:
@@ -75,8 +94,8 @@ async def get_by_tweet(db_path: str, channel_id: int, tweet_id: str) -> Candidat
 
 
 async def get_channel(db_path: str, channel_id: int) -> ChannelInfo | None:
-    """Метаданные одного канала по id — для /essay со своей темой."""
-    sql = "SELECT id, title, niche, target_chat_id FROM channels WHERE id = ? LIMIT 1"
+    """Метаданные канала по id — для /essay со своей темой и проверки владения."""
+    sql = f"SELECT {_CH_COLS} FROM channels WHERE id = ? LIMIT 1"
     async with aiosqlite.connect(_ro_uri(db_path), uri=True) as db:
         row = await (await db.execute(sql, (channel_id,))).fetchone()
-    return ChannelInfo(row[0], row[1], row[2], row[3]) if row else None
+    return _row_to_channel(row) if row else None

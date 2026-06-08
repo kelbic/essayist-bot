@@ -1,8 +1,12 @@
-"""Своя БД эссеист-бота (pending_drafts). НИ БАЙТА в базу twidgest.
+"""Своя БД эссеист-бота (pending_drafts + tenant-слой). НИ БАЙТА в базу twidgest.
 
 Ключевая защита (Момент 1): атомарный дедуп публикации через статус-машину.
 claim_for_publish переводит pending→publishing ровно один раз; повторное нажатие
 получит False и ничего не отправит. Плюс append-only аудит-лог опубликованного.
+
+Tenant-слой (вариант B): допуск к Essayist Pro (essayist_users) и per-channel
+конфиг автоподбора (essay_config) живут ЗДЕСЬ; владение каналом читается из
+twidgest read-only (candidates). Связующий ключ — Telegram user id.
 """
 from __future__ import annotations
 
@@ -23,6 +27,7 @@ def _now() -> str:
 class Draft:
     id: int
     channel_id: int
+    owner_user_id: int | None
     tweet_id: str
     tweet_text: str
     author: str | None
@@ -43,6 +48,7 @@ _SCHEMA = """
 CREATE TABLE IF NOT EXISTS pending_drafts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     channel_id INTEGER NOT NULL,
+    owner_user_id INTEGER,
     tweet_id TEXT,
     tweet_text TEXT,
     author TEXT,
@@ -70,6 +76,27 @@ CREATE TABLE IF NOT EXISTS channel_flags (channel_id INTEGER PRIMARY KEY, enable
 """
 
 
+# Tenant-слой. Создаётся ПОСЛЕ миграции owner_user_id — индекс ниже на неё опирается.
+_TENANT_SCHEMA = """
+CREATE TABLE IF NOT EXISTS essayist_users (
+    user_id    INTEGER PRIMARY KEY,          -- == twidgest tg_user_id
+    enabled    INTEGER NOT NULL DEFAULT 0,   -- допуск к Essayist Pro
+    note       TEXT,
+    granted_at TEXT
+);
+CREATE TABLE IF NOT EXISTS essay_config (
+    channel_id      INTEGER PRIMARY KEY,      -- id канала в twidgest
+    user_id         INTEGER NOT NULL,         -- владелец (кэш из twidgest, для фильтра)
+    enabled         INTEGER NOT NULL DEFAULT 0,   -- ОПТ-ИН: по умолчанию выкл
+    frequency_hours INTEGER NOT NULL DEFAULT 12,
+    mode            TEXT NOT NULL DEFAULT 'hil',  -- hil | auto
+    last_run_at     TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_essay_config_user ON essay_config(user_id);
+CREATE INDEX IF NOT EXISTS idx_pending_owner ON pending_drafts(owner_user_id, status);
+"""
+
+
 class Store:
     """status: pending | publishing | published | rejected | regenerating"""
 
@@ -81,19 +108,29 @@ class Store:
         async with aiosqlite.connect(self.db_path) as db:
             await db.executescript(_SCHEMA)
             await db.executescript(_SETTINGS_SCHEMA)
+            await self._migrate(db)          # дотягиваем старую БД до новой схемы
+            await db.executescript(_TENANT_SCHEMA)
             await db.commit()
+
+    async def _migrate(self, db) -> None:
+        """Идемпотентные миграции для уже существующих essayist.db."""
+        cur = await db.execute("PRAGMA table_info(pending_drafts)")
+        cols = {r[1] for r in await cur.fetchall()}
+        if "owner_user_id" not in cols:
+            await db.execute("ALTER TABLE pending_drafts ADD COLUMN owner_user_id INTEGER")
 
     async def create_draft(self, *, channel_id, tweet_id, tweet_text, author, niche,
                            target_chat_id, title, brief, draft, violations,
-                           total_searches) -> int:
+                           total_searches, owner_user_id=None) -> int:
         async with aiosqlite.connect(self.db_path) as db:
             cur = await db.execute(
-                "INSERT INTO pending_drafts (channel_id, tweet_id, tweet_text, author, "
-                "niche, target_chat_id, title, brief, draft, violations_json, "
+                "INSERT INTO pending_drafts (channel_id, owner_user_id, tweet_id, tweet_text, "
+                "author, niche, target_chat_id, title, brief, draft, violations_json, "
                 "total_searches, status, created_at) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?, 'pending', ?)",
-                (channel_id, tweet_id, tweet_text, author, niche, target_chat_id, title,
-                 brief, draft, json.dumps(violations, ensure_ascii=False), total_searches, _now()),
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?, 'pending', ?)",
+                (channel_id, owner_user_id, tweet_id, tweet_text, author, niche, target_chat_id,
+                 title, brief, draft, json.dumps(violations, ensure_ascii=False),
+                 total_searches, _now()),
             )
             await db.commit()
             return cur.lastrowid
@@ -106,10 +143,11 @@ class Store:
         if not row:
             return None
         return Draft(
-            id=row["id"], channel_id=row["channel_id"], tweet_id=row["tweet_id"],
-            tweet_text=row["tweet_text"], author=row["author"], niche=row["niche"],
-            target_chat_id=row["target_chat_id"], title=row["title"], brief=row["brief"],
-            draft=row["draft"], violations=json.loads(row["violations_json"] or "[]"),
+            id=row["id"], channel_id=row["channel_id"], owner_user_id=row["owner_user_id"],
+            tweet_id=row["tweet_id"], tweet_text=row["tweet_text"], author=row["author"],
+            niche=row["niche"], target_chat_id=row["target_chat_id"], title=row["title"],
+            brief=row["brief"], draft=row["draft"],
+            violations=json.loads(row["violations_json"] or "[]"),
             total_searches=row["total_searches"], status=row["status"],
             revision_count=row["revision_count"], reject_reason=row["reject_reason"],
             published_message_id=row["published_message_id"],
@@ -132,13 +170,13 @@ class Store:
                 (message_id, _now(), _now(), draft_id))
             await db.commit()
             row = await (await db.execute(
-                "SELECT channel_id, tweet_id, target_chat_id FROM pending_drafts WHERE id=?",
+                "SELECT channel_id, tweet_id, target_chat_id, owner_user_id FROM pending_drafts WHERE id=?",
                 (draft_id,))).fetchone()
         with open(self.publish_log, "a", encoding="utf-8") as f:
             f.write(json.dumps({
                 "ts": _now(), "draft_id": draft_id, "message_id": message_id,
                 "channel_id": row[0], "tweet_id": row[1], "target_chat_id": row[2],
-                "sender": "essayist-bot",
+                "owner_user_id": row[3], "sender": "essayist-bot",
             }, ensure_ascii=False) + "\n")
 
     async def revert_publish(self, draft_id: int) -> None:
@@ -214,3 +252,78 @@ class Store:
                 "SELECT tweet_id FROM pending_drafts "
                 "WHERE channel_id=? AND status='published'", (channel_id,))).fetchall()
         return {r[0] for r in rows}
+
+    # ---------------------------------------------------------------- tenant-слой
+    # Допуск к Essayist Pro (entitlement). Управляет суперадмин; позже — биллинг.
+
+    async def user_enabled(self, user_id: int) -> bool:
+        async with aiosqlite.connect(self.db_path) as db:
+            row = await (await db.execute(
+                "SELECT enabled FROM essayist_users WHERE user_id=?", (user_id,))).fetchone()
+        return bool(row and row[0])
+
+    async def set_user_enabled(self, user_id: int, enabled: bool, note: str | None = None) -> None:
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                "INSERT INTO essayist_users(user_id, enabled, note, granted_at) VALUES(?,?,?,?) "
+                "ON CONFLICT(user_id) DO UPDATE SET enabled=excluded.enabled, note=excluded.note",
+                (user_id, 1 if enabled else 0, note, _now()))
+            await db.commit()
+
+    async def list_entitled(self) -> list[dict]:
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            rows = await (await db.execute(
+                "SELECT user_id, enabled, note, granted_at FROM essayist_users "
+                "ORDER BY user_id")).fetchall()
+        return [dict(r) for r in rows]
+
+    # Per-channel конфиг автоподбора (заменяет глобальные settings/channel_flags).
+
+    async def _ensure_cfg(self, db, channel_id: int, user_id: int) -> None:
+        await db.execute(
+            "INSERT OR IGNORE INTO essay_config(channel_id, user_id) VALUES(?, ?)",
+            (channel_id, user_id))
+
+    async def get_essay_config(self, channel_id: int) -> dict | None:
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            row = await (await db.execute(
+                "SELECT * FROM essay_config WHERE channel_id=?", (channel_id,))).fetchone()
+        return dict(row) if row else None
+
+    async def set_essay_enabled(self, channel_id: int, user_id: int, enabled: bool) -> None:
+        async with aiosqlite.connect(self.db_path) as db:
+            await self._ensure_cfg(db, channel_id, user_id)
+            await db.execute("UPDATE essay_config SET enabled=?, user_id=? WHERE channel_id=?",
+                             (1 if enabled else 0, user_id, channel_id))
+            await db.commit()
+
+    async def set_essay_frequency(self, channel_id: int, user_id: int, hours: int) -> None:
+        async with aiosqlite.connect(self.db_path) as db:
+            await self._ensure_cfg(db, channel_id, user_id)
+            await db.execute("UPDATE essay_config SET frequency_hours=? WHERE channel_id=?",
+                             (hours, channel_id))
+            await db.commit()
+
+    async def set_essay_mode(self, channel_id: int, user_id: int, mode: str) -> None:
+        async with aiosqlite.connect(self.db_path) as db:
+            await self._ensure_cfg(db, channel_id, user_id)
+            await db.execute("UPDATE essay_config SET mode=? WHERE channel_id=?",
+                             (mode, channel_id))
+            await db.commit()
+
+    async def touch_essay_run(self, channel_id: int) -> None:
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("UPDATE essay_config SET last_run_at=? WHERE channel_id=?",
+                             (_now(), channel_id))
+            await db.commit()
+
+    async def enabled_essay_channels(self) -> list[dict]:
+        """Каналы с включённым автоподбором — для таймера (с владельцем и расписанием)."""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            rows = await (await db.execute(
+                "SELECT channel_id, user_id, frequency_hours, mode, last_run_at "
+                "FROM essay_config WHERE enabled=1")).fetchall()
+        return [dict(r) for r in rows]
