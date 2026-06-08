@@ -6,6 +6,8 @@
 Мультитенант (вариант B): доступ через auth.py — суперадмин → допуск (Essayist Pro)
 → владение каналом. Таймер ходит по per-channel essay_config (opt-in, по умолчанию
 выкл), уважает frequency_hours/last_run_at и шлёт карточку ВЛАДЕЛЬЦУ канала.
+Онбординг: владелец жмёт /start (реестр bot_users), суперадмин выдаёт доступ
+/grant, бот проверяет права в канале (getChat) перед включением автоподбора.
 """
 from __future__ import annotations
 
@@ -53,10 +55,22 @@ INTERVAL_CHOICES = (3, 6, 12, 24)
 NO_ACCESS_CHANNEL = "Нет доступа к этому каналу — он не твой."
 NO_ACCESS_DRAFT = "Нет доступа к этому черновику."
 NO_PRO = "Доступ к Essayist Pro не активирован. Обратись к администратору."
+NEED_ADMIN_RIGHTS = ("Бот не админ этого канала (или без права постинга). "
+                     "Добавь @essayist_bot админом с правом Post Messages — потом включи.")
 
 
 def _is_admin(uid: int) -> bool:
     return ADMIN != 0 and uid == ADMIN
+
+
+def _bot_can_post(member) -> bool:
+    """Может ли бот постить в канал по его членству: создатель или админ с can_post_messages."""
+    status = getattr(member, "status", None)
+    if status == "creator":
+        return True
+    if status == "administrator":
+        return bool(getattr(member, "can_post_messages", False))
+    return False
 
 
 def _is_due(last_run_at: str | None, frequency_hours: int, now: datetime | None = None) -> bool:
@@ -143,6 +157,74 @@ def _card(cand_title: str, author: str | None, niche: str, res) -> str:
         head += "\n\n✅ Редактор: замечаний нет"
     head += "\n\nЧерновик — выше. Решение:"
     return head[:TG_LIMIT]
+
+
+@dp.message(Command("start"))
+async def cmd_start(message: Message, command: CommandObject) -> None:
+    uid = message.from_user.id
+    await st.mark_started(uid)  # теперь таймер сможет писать этому владельцу первым
+    if await auth.is_entitled(st, uid, ADMIN):
+        await message.answer(
+            "Привет! Essayist Pro активирован.\n\n"
+            "• /essay <id> — собрать разбор по теме канала (или своей)\n"
+            "• /timer — автоподбор: вкл/выкл и частота по каналам\n\n"
+            "Чтобы автоподбор постил, бот должен быть админом твоего канала с правом Post Messages.")
+    else:
+        await message.answer(
+            "Привет! Это Essayist — бот авторских разборов для каналов.\n\n"
+            "Доступ к Essayist Pro пока не активирован. Когда администратор выдаст доступ, "
+            "тебе станут доступны /essay и /timer.")
+
+
+@dp.message(Command("grant"))
+async def cmd_grant(message: Message, command: CommandObject) -> None:
+    if not _is_admin(message.from_user.id):
+        return
+    parts = (command.args or "").split(maxsplit=1)
+    if not parts:
+        await message.answer("Формат: /grant <user_id> [заметка]")
+        return
+    try:
+        uid = int(parts[0])
+    except ValueError:
+        await message.answer("user_id должен быть числом. Формат: /grant <user_id> [заметка]")
+        return
+    note = parts[1] if len(parts) > 1 else None
+    await st.set_user_enabled(uid, True, note)
+    started = await st.is_started(uid)
+    tail = "" if started else "\n⚠️ Пользователь ещё не нажимал Start — попроси его открыть бота и нажать /start."
+    await message.answer(f"✅ Доступ выдан: {uid}" + (f" ({note})" if note else "") + tail)
+
+
+@dp.message(Command("revoke"))
+async def cmd_revoke(message: Message, command: CommandObject) -> None:
+    if not _is_admin(message.from_user.id):
+        return
+    arg = (command.args or "").strip()
+    try:
+        uid = int(arg)
+    except ValueError:
+        await message.answer("Формат: /revoke <user_id>")
+        return
+    await st.set_user_enabled(uid, False)
+    await message.answer(f"🚫 Доступ отозван: {uid}")
+
+
+@dp.message(Command("grants"))
+async def cmd_grants(message: Message, command: CommandObject) -> None:
+    if not _is_admin(message.from_user.id):
+        return
+    rows = await st.list_entitled()
+    if not rows:
+        await message.answer("Список допущенных пуст.")
+        return
+    lines = []
+    for r in rows:
+        mark = "✅" if r["enabled"] else "🚫"
+        started = "" if await st.is_started(r["user_id"]) else " · не нажал Start"
+        note = f" — {r['note']}" if r.get("note") else ""
+        lines.append(f"{mark} {r['user_id']}{note}{started}")
+    await message.answer("Допуски Essayist Pro:\n" + "\n".join(lines))
 
 
 @dp.message(Command("essay"))
@@ -399,7 +481,17 @@ async def cb_estog(cq: CallbackQuery) -> None:
         return await cq.answer(NO_ACCESS_CHANNEL, show_alert=True)
     cfg = await st.get_essay_config(cid)
     now_on = bool(cfg and cfg["enabled"])
+    if not now_on:  # включаем — проверим, что бот реально может постить в этот канал
+        try:
+            me = await cq.bot.get_me()
+            member = await cq.bot.get_chat_member(ch.target_chat_id, me.id)
+        except Exception as exc:
+            return await cq.answer(f"Не вижу канал ({exc}). Добавь бота админом.", show_alert=True)
+        if not _bot_can_post(member):
+            return await cq.answer(NEED_ADMIN_RIGHTS, show_alert=True)
     await st.set_essay_enabled(cid, ch.user_id, not now_on)
+    if not now_on:
+        await st.set_essay_error(cid, None)  # включили с правами — чистим старую ошибку
     text, kb = await _timer_panel(uid)
     await _safe_edit(cq.message, text, kb)
     await cq.answer("Включён" if not now_on else "Выключен")
@@ -471,8 +563,12 @@ async def run_timer_tick(bot: Bot) -> None:
         try:
             await bot.send_chat_action(owner, "typing")
         except Exception as exc:
-            log.warning("timer: владелец %s недоступен (канал %s): %s", owner, cid, exc)
-            await st.set_essay_error(cid, f"не доставить владельцу (нажал ли он Start у бота?): {exc}")
+            if not await st.is_started(owner):
+                msg = "владелец не нажал Start у бота (нет диалога)"
+            else:
+                msg = f"не доставить владельцу: {exc}"
+            log.warning("timer: владелец %s недоступен (канал %s): %s", owner, cid, msg)
+            await st.set_essay_error(cid, msg)
             continue
         if await _timer_send(bot, owner, pick, owner):
             await st.touch_essay_run(cid)
@@ -502,6 +598,7 @@ async def main() -> None:
     bot = Bot(token)
     asyncio.create_task(timer_loop(bot))
     await bot.set_my_commands([
+        BotCommand(command="start", description="Начать / зарегистрироваться у бота"),
         BotCommand(command="essay", description="Разбор: выбрать тему канала — /essay <id> [all]"),
         BotCommand(command="timer", description="Автоподбор: вкл/выкл и частота по каналам"),
     ])

@@ -78,6 +78,10 @@ CREATE TABLE IF NOT EXISTS channel_flags (channel_id INTEGER PRIMARY KEY, enable
 
 # Tenant-слой. Создаётся ПОСЛЕ миграции owner_user_id — индекс ниже на неё опирается.
 _TENANT_SCHEMA = """
+CREATE TABLE IF NOT EXISTS bot_users (
+    user_id    INTEGER PRIMARY KEY,          -- нажал /start → боту можно писать первым
+    started_at TEXT
+);
 CREATE TABLE IF NOT EXISTS essayist_users (
     user_id    INTEGER PRIMARY KEY,          -- == twidgest tg_user_id
     enabled    INTEGER NOT NULL DEFAULT 0,   -- допуск к Essayist Pro
@@ -286,6 +290,21 @@ class Store:
                 "SELECT user_id, enabled, note, granted_at FROM essayist_users "
                 "ORDER BY user_id")).fetchall()
         return [dict(r) for r in rows]
+
+    # Реестр /start: кому бот может писать первым (Telegram запрещает иначе).
+
+    async def mark_started(self, user_id: int) -> None:
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                "INSERT OR IGNORE INTO bot_users(user_id, started_at) VALUES(?, ?)",
+                (user_id, _now()))
+            await db.commit()
+
+    async def is_started(self, user_id: int) -> bool:
+        async with aiosqlite.connect(self.db_path) as db:
+            row = await (await db.execute(
+                "SELECT 1 FROM bot_users WHERE user_id=?", (user_id,))).fetchone()
+        return row is not None
 
     # Per-channel конфиг автоподбора (заменяет глобальные settings/channel_flags).
 
