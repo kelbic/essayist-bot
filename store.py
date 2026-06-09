@@ -11,7 +11,7 @@ twidgest read-only (candidates). Связующий ключ — Telegram user i
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass
 
 import aiosqlite
@@ -21,6 +21,23 @@ REJECT_REASONS = ("факт-ошибка", "стиль", "не интересн�
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _now_plus_days(days: int) -> str:
+    return (datetime.now(timezone.utc) + timedelta(days=days)).isoformat()
+
+
+def _not_expired(expires_at: str | None) -> bool:
+    """True если срок не задан (бессрочно) или ещё не истёк. Битую дату трактуем как активную."""
+    if not expires_at:
+        return True
+    try:
+        exp = datetime.fromisoformat(expires_at)
+    except ValueError:
+        return True
+    if exp.tzinfo is None:
+        exp = exp.replace(tzinfo=timezone.utc)
+    return exp > datetime.now(timezone.utc)
 
 
 @dataclass
@@ -86,7 +103,8 @@ CREATE TABLE IF NOT EXISTS essayist_users (
     user_id    INTEGER PRIMARY KEY,          -- == twidgest tg_user_id
     enabled    INTEGER NOT NULL DEFAULT 0,   -- допуск к Essayist Pro
     note       TEXT,
-    granted_at TEXT
+    granted_at TEXT,
+    expires_at TEXT
 );
 CREATE TABLE IF NOT EXISTS essay_config (
     channel_id      INTEGER PRIMARY KEY,      -- id канала в twidgest
@@ -133,11 +151,15 @@ class Store:
             await db.execute("ALTER TABLE pending_drafts ADD COLUMN owner_user_id INTEGER")
 
     async def _migrate_tenant(self, db) -> None:
-        """Идемпотентно: last_error в уже существующей essay_config."""
+        """Идемпотентно: last_error в essay_config и expires_at в essayist_users."""
         cur = await db.execute("PRAGMA table_info(essay_config)")
         cols = {r[1] for r in await cur.fetchall()}
         if "last_error" not in cols:
             await db.execute("ALTER TABLE essay_config ADD COLUMN last_error TEXT")
+        cur = await db.execute("PRAGMA table_info(essayist_users)")
+        ucols = {r[1] for r in await cur.fetchall()}
+        if "expires_at" not in ucols:
+            await db.execute("ALTER TABLE essayist_users ADD COLUMN expires_at TEXT")
 
     async def create_draft(self, *, channel_id, tweet_id, tweet_text, author, niche,
                            target_chat_id, title, brief, draft, violations,
@@ -277,26 +299,44 @@ class Store:
     # Допуск к Essayist Pro (entitlement). Управляет суперадмин; позже — биллинг.
 
     async def user_enabled(self, user_id: int) -> bool:
+        """Допущен И срок не истёк. expires_at IS NULL = бессрочно."""
         async with aiosqlite.connect(self.db_path) as db:
             row = await (await db.execute(
-                "SELECT enabled FROM essayist_users WHERE user_id=?", (user_id,))).fetchone()
-        return bool(row and row[0])
+                "SELECT enabled, expires_at FROM essayist_users WHERE user_id=?",
+                (user_id,))).fetchone()
+        if not row or not row[0]:
+            return False
+        return _not_expired(row[1])
 
-    async def set_user_enabled(self, user_id: int, enabled: bool, note: str | None = None) -> None:
+    async def set_user_enabled(self, user_id: int, enabled: bool, note: str | None = None,
+                               days: int | None = None) -> None:
+        """Выдать/снять допуск. days=N → срок now+N; days=None → бессрочно (expires_at NULL).
+        При снятии (enabled=False) срок обнуляется."""
+        expires = _now_plus_days(days) if (enabled and days is not None) else None
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute(
-                "INSERT INTO essayist_users(user_id, enabled, note, granted_at) VALUES(?,?,?,?) "
-                "ON CONFLICT(user_id) DO UPDATE SET enabled=excluded.enabled, note=excluded.note",
-                (user_id, 1 if enabled else 0, note, _now()))
+                "INSERT INTO essayist_users(user_id, enabled, note, granted_at, expires_at) "
+                "VALUES(?,?,?,?,?) "
+                "ON CONFLICT(user_id) DO UPDATE SET enabled=excluded.enabled, "
+                "note=excluded.note, expires_at=excluded.expires_at",
+                (user_id, 1 if enabled else 0, note, _now(), expires))
             await db.commit()
 
     async def list_entitled(self) -> list[dict]:
         async with aiosqlite.connect(self.db_path) as db:
             db.row_factory = aiosqlite.Row
             rows = await (await db.execute(
-                "SELECT user_id, enabled, note, granted_at FROM essayist_users "
+                "SELECT user_id, enabled, note, granted_at, expires_at FROM essayist_users "
                 "ORDER BY user_id")).fetchall()
         return [dict(r) for r in rows]
+
+    async def get_entitlement(self, user_id: int) -> dict | None:
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            row = await (await db.execute(
+                "SELECT user_id, enabled, note, granted_at, expires_at FROM essayist_users "
+                "WHERE user_id=?", (user_id,))).fetchone()
+        return dict(row) if row else None
 
     # Реестр /start: кому бот может писать первым (Telegram запрещает иначе).
 
