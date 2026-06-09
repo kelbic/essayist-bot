@@ -52,7 +52,7 @@ DEFAULT_FREQ_HOURS = 12    # частота разбора по умолчани
 FRESH_HOURS = 24           # автоподбор берёт твиты не старше N часов (по queued_at)
 MAX_PICK_ATTEMPTS = 3      # сколько кандидатов пробовать за тик, прежде чем сдаться
 TRIAL_DAYS = 7             # срок триала Essayist Pro по умолчанию (/grant без аргумента)
-INTERVAL_CHOICES = (3, 6, 12, 24)
+INTERVAL_CHOICES = (3, 6, 9, 12, 24)
 
 NO_ACCESS_CHANNEL = "Нет доступа к этому каналу — он не твой."
 NO_ACCESS_DRAFT = "Нет доступа к этому черновику."
