@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import datetime
 import os
 from dataclasses import dataclass, field
 
@@ -16,7 +17,7 @@ import aiohttp
 ANTHROPIC_URL = "https://api.anthropic.com/v1/messages"
 ANTHROPIC_VERSION = "2023-06-01"
 RETRYABLE_HTTP = {408, 429, 500, 502, 503, 504, 529}
-DEFAULT_MODEL = "claude-sonnet-4-20250514"
+DEFAULT_MODEL = "claude-sonnet-4-6"
 DEFAULT_FAST_MODEL = "claude-haiku-4-5"
 
 
@@ -44,8 +45,20 @@ class _Anthropic:
         }
 
     def _payload(self, system, user, max_tokens, temperature, tools=None) -> dict:
+        # Текущая дата в каждый системный промпт. Без неё модель сверяет
+        # результаты поиска со своим внутренним «сейчас» (= cutoff обучения)
+        # и отвергает РЕАЛЬНЫЕ свежие статьи как «вымысел с датами из
+        # будущего». Реальный кейс: анонс Claude Fable 5 от 09.06.2026 был
+        # найден поиском и отброшен синтезатором именно по этой причине.
+        dated_system = (
+            f"Сегодня {datetime.utcnow():%Y-%m-%d} (UTC). Твои знания старее "
+            f"этой даты. Результаты веб-поиска с датами до сегодняшней "
+            f"ВКЛЮЧИТЕЛЬНО — нормальные свежие публикации, а не вымысел; "
+            f"не отвергай их из-за того, что дата позже твоих знаний.\n\n"
+            + system
+        )
         p = {"model": self.model, "max_tokens": max_tokens, "temperature": temperature,
-             "system": system, "messages": [{"role": "user", "content": user}]}
+             "system": dated_system, "messages": [{"role": "user", "content": user}]}
         if tools:
             p["tools"] = tools
         return p
