@@ -159,6 +159,14 @@ SYNTHESIZER_SYSTEM = """Тебе дают тему (твит) и факты по
 - <факт> — [источник]
 Последней строкой: "НЕ ПОДТВЕРЖДЕНО: <что отброшено и почему>".
 
+ЧАСТИЧНАЯ ВЕРИФИКАЦИЯ: если сам ПРЕДМЕТ твита (продукт, компания, событие)
+подтверждается источниками, но КЛЮЧЕВОЕ УТВЕРЖДЕНИЕ твита о нём не подтверждается
+ни одним — верни ПЕРВОЙ строкой ровно:
+TOPIC_PARTIAL
+ниже — обычный бриф подтверждённых фактов о предмете (тот же формат), и последней
+строкой обязательно: "НЕ ПОДТВЕРЖДЕНО: <ключевое утверждение твита, кратко>".
+Не называй утверждение ложью или фейком: отсутствие подтверждения — не опровержение.
+
 КРИТИЧЕСКОЕ ПРАВИЛО: если САМ ПРЕДМЕТ твита (продукт, событие, заявление)
 не подтверждается НИ ОДНИМ источником из фактов — верни ПЕРВОЙ строкой ровно:
 TOPIC_UNVERIFIED
@@ -265,10 +273,19 @@ async def _revise(writer, tweet, brief, draft, violations, channel, niche, lengt
     return await writer.call(_drafter_system(niche, channel, length_rule), user, 3500, 0.4)
 
 
-async def _draft(writer, tweet, brief, channel, niche, length_rule):
+async def _draft(writer, tweet, brief, channel, niche, length_rule, partial: bool = False):
+    partial_rule = ""
+    if partial:
+        partial_rule = (
+            "\n\nРЕЖИМ «ЧАСТИЧНАЯ ВЕРИФИКАЦИЯ»: ключевое утверждение твита не "
+            "подтвердилось поиском (см. строку «НЕ ПОДТВЕРЖДЕНО» брифа). Пиши разбор "
+            "по подтверждённым фактам о реальном предмете, и отдельным абзацем ближе "
+            "к началу честно обозначь: какое утверждение разошлось по сети и что его "
+            "первоисточник не находится. Без слов «фейк», «ложь», «дезинформация» — "
+            "только граница знания. Остальной текст — о подтверждённом.")
     user = (f"ИСХОДНЫЙ ТВИТ (сигнал темы):\n{tweet}\n\n"
             f"БРИФ ПРОВЕРЕННОЙ ФАКТУРЫ (единственный источник фактов):\n{brief}\n\n"
-            f"Канал для подвала: {channel}\n\nНапиши разбор. Начни сразу с хука.")
+            f"Канал для подвала: {channel}{partial_rule}\n\nНапиши разбор. Начни сразу с хука.")
     return await writer.call(_drafter_system(niche, channel, length_rule), user, 3500, 0.6)
 
 
@@ -334,7 +351,14 @@ async def generate_essay(
             total_searches=total,
         )
 
-    draft = await _draft(strong, tweet, brief, channel, niche, length_rule)
+    partial = brief.strip().upper().startswith("TOPIC_PARTIAL")
+    if partial:
+        # Предмет реален, ключевое утверждение твита не подтвердилось:
+        # пишем разбор по подтверждённому с честной границей знания.
+        brief = brief.strip().split("\n", 1)[1] if "\n" in brief.strip() else brief
+
+    draft = await _draft(strong, tweet, brief, channel, niche, length_rule,
+                         partial=partial)
     if not draft:
         return EssayResult(ok=False, error="генератор вернул пусто", brief=brief, total_searches=total)
 
