@@ -106,6 +106,17 @@ CREATE TABLE IF NOT EXISTS essayist_users (
     granted_at TEXT,
     expires_at TEXT
 );
+CREATE TABLE IF NOT EXISTS essay_costs (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    channel_id INTEGER NOT NULL,
+    user_id    INTEGER NOT NULL,
+    ok         INTEGER NOT NULL,
+    searches   INTEGER NOT NULL DEFAULT 0,
+    tokens_in  INTEGER NOT NULL DEFAULT 0,
+    tokens_out INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_costs_created ON essay_costs(created_at);
 CREATE TABLE IF NOT EXISTS essay_config (
     channel_id      INTEGER PRIMARY KEY,      -- id канала в twidgest
     user_id         INTEGER NOT NULL,         -- владелец (кэш из twidgest, для фильтра)
@@ -368,6 +379,30 @@ class Store:
             if cur.rowcount == 0:
                 return (False, int(row[1] or 0), quota)
             return (True, int(row[1] or 0) + 1, quota)
+
+    # ------------------------------------------------ себестоимость (учёт)
+    async def record_cost(self, channel_id: int, user_id: int, ok: bool,
+                          searches: int, tokens_in: int, tokens_out: int) -> None:
+        """Одна строка на каждую генерацию (включая неудачные — они тоже стоят денег)."""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                "INSERT INTO essay_costs(channel_id, user_id, ok, searches, "
+                "tokens_in, tokens_out, created_at) VALUES(?,?,?,?,?,?,?)",
+                (channel_id, user_id, 1 if ok else 0, searches,
+                 tokens_in, tokens_out, _now()))
+            await db.commit()
+
+    async def costs_since(self, since_iso: str) -> list[dict]:
+        """Агрегат по каналам с момента since: генерации, успехи, поиски, токены."""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            rows = await (await db.execute(
+                "SELECT channel_id, COUNT(*) AS runs, SUM(ok) AS ok_runs, "
+                "SUM(searches) AS searches, SUM(tokens_in) AS tin, "
+                "SUM(tokens_out) AS tout FROM essay_costs "
+                "WHERE created_at >= ? GROUP BY channel_id ORDER BY runs DESC",
+                (since_iso,))).fetchall()
+        return [dict(r) for r in rows]
 
     async def refund_essay(self, user_id: int) -> None:
         """Возврат списания (генерация не удалась). Безопасно для любых планов."""

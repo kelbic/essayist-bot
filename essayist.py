@@ -29,12 +29,16 @@ class EssayResult:
     violations: list[dict] = field(default_factory=list)
     total_searches: int = 0
     error: str = ""
+    tokens_in: int = 0
+    tokens_out: int = 0
 
 
 class _Anthropic:
     def __init__(self, api_key: str, model: str, max_attempts: int = 6,
                  base_delay: float = 5.0, timeout: int = 180) -> None:
         self.model = model
+        self.usage_in = 0
+        self.usage_out = 0
         self.max_attempts = max_attempts
         self.base_delay = base_delay
         self.timeout = timeout
@@ -85,13 +89,20 @@ class _Anthropic:
     def _text(data: dict) -> str:
         return "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text")
 
+    def _track(self, data) -> None:
+        u = (data or {}).get("usage") or {}
+        self.usage_in += int(u.get("input_tokens") or 0)
+        self.usage_out += int(u.get("output_tokens") or 0)
+
     async def call(self, system, user, max_tokens, temperature=0.3) -> str | None:
         data = await self._post(self._payload(system, user, max_tokens, temperature))
+        self._track(data)
         return self._text(data) if data else None
 
     async def search(self, system, user, max_tokens, max_uses=3, temperature=0.2):
         tools = [{"type": "web_search_20250305", "name": "web_search", "max_uses": max_uses}]
         data = await self._post(self._payload(system, user, max_tokens, temperature, tools))
+        self._track(data)
         if not data:
             return None, 0
         n = ((data.get("usage") or {}).get("server_tool_use") or {}).get("web_search_requests") or 0
@@ -324,9 +335,15 @@ async def generate_essay(
     searcher = _Anthropic(key, fast)
     strong = _Anthropic(key, model)
 
+    def _res(**kw) -> EssayResult:
+        """EssayResult с авто-вшитыми токенами всех трёх клиентов (учёт себестоимости)."""
+        kw.setdefault("tokens_in", planner.usage_in + searcher.usage_in + strong.usage_in)
+        kw.setdefault("tokens_out", planner.usage_out + searcher.usage_out + strong.usage_out)
+        return EssayResult(**kw)
+
     questions = await _plan(planner, tweet, max_questions)
     if not questions:
-        return EssayResult(ok=False, error="планировщик не вернул вопросов")
+        return _res(ok=False, error="планировщик не вернул вопросов")
 
     sem = asyncio.Semaphore(2)
 
@@ -337,18 +354,18 @@ async def generate_essay(
     results = await asyncio.gather(*[_guarded(q) for q in questions])
     total = sum(n for _, n in results)
     if total == 0:
-        return EssayResult(ok=False, error="веб-поиск не выполнился ни разу (предохранитель)")
+        return _res(ok=False, error="веб-поиск не выполнился ни разу (предохранитель)")
     findings = [(q, a) for q, (a, _) in zip(questions, results) if a]
     if not findings:
-        return EssayResult(ok=False, error="поиск не вернул текста")
+        return _res(ok=False, error="поиск не вернул текста")
 
     brief = await _synthesize(strong, tweet, findings)
     if not brief:
-        return EssayResult(ok=False, error="синтез вернул пусто", total_searches=total)
+        return _res(ok=False, error="синтез вернул пусто", total_searches=total)
     if brief.strip().upper().startswith("TOPIC_UNVERIFIED"):
         detail = brief.strip().split("\n", 1)
         why = detail[1].strip()[:300] if len(detail) > 1 else ""
-        return EssayResult(
+        return _res(
             ok=False,
             error=(
                 "тема не подтвердилась веб-поиском — возможно, новость свежее "
@@ -368,7 +385,7 @@ async def generate_essay(
     draft = await _draft(strong, tweet, brief, channel, niche, length_rule,
                          partial=partial)
     if not draft:
-        return EssayResult(ok=False, error="генератор вернул пусто", brief=brief, total_searches=total)
+        return _res(ok=False, error="генератор вернул пусто", brief=brief, total_searches=total)
 
     violations: list[dict] = []
     if run_critic:
@@ -379,4 +396,4 @@ async def generate_essay(
             if fixed:
                 draft = fixed
 
-    return EssayResult(ok=True, brief=brief, draft=draft, violations=violations, total_searches=total)
+    return _res(ok=True, brief=brief, draft=draft, violations=violations, total_searches=total)

@@ -281,6 +281,48 @@ async def on_paid(message: Message) -> None:
         f"Статус всегда в /start. Спасибо!")
 
 
+# Цены для оценки себестоимости (USD). СВЕРЯЙ с актуальным прайсом Anthropic:
+# токены считаем по основной модели (верхняя оценка: planner/searcher на fast дешевле).
+COST_IN_PER_MTOK = 3.0
+COST_OUT_PER_MTOK = 15.0
+COST_PER_1K_SEARCHES = 10.0
+
+
+@dp.message(Command("costs"))
+async def cmd_costs(message: Message, command: CommandObject) -> None:
+    if not _is_admin(message.from_user.id):
+        return
+    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+    days = 7
+    arg = (command.args or "").strip()
+    if arg.isdigit():
+        days = max(1, min(90, int(arg)))
+    since = (_dt.now(_tz.utc) - _td(days=days)).isoformat()
+    rows = await st.costs_since(since)
+    if not rows:
+        await message.answer(f"За {days} дн. генераций не было.")
+        return
+    lines = [f"💸 <b>Себестоимость Essayist за {days} дн.</b> (верхняя оценка)\n"]
+    t_runs = t_usd = 0.0
+    for r in rows:
+        usd = (r["tin"] / 1e6 * COST_IN_PER_MTOK
+               + r["tout"] / 1e6 * COST_OUT_PER_MTOK
+               + r["searches"] / 1000 * COST_PER_1K_SEARCHES)
+        per = usd / r["runs"] if r["runs"] else 0
+        t_runs += r["runs"]; t_usd += usd
+        lines.append(
+            f"Канал {r['channel_id']}: {r['runs']} генераций "
+            f"(ок {r['ok_runs']}), поисков {r['searches']}, "
+            f"токены {r['tin']/1000:.0f}k/{r['tout']/1000:.0f}k → "
+            f"<b>${usd:.2f}</b> (${per:.3f}/шт)")
+    if t_runs:
+        lines.append(
+            f"\nИтого: {int(t_runs)} генераций, <b>${t_usd:.2f}</b> "
+            f"(${t_usd/t_runs:.3f}/шт). Квота 20 разборов ≈ "
+            f"<b>${t_usd/t_runs*20:.2f}</b> себестоимости против 1490⭐.")
+    await message.answer("\n".join(lines))
+
+
 @dp.message(Command("grant"))
 async def cmd_grant(message: Message, command: CommandObject) -> None:
     if not _is_admin(message.from_user.id):
@@ -414,6 +456,8 @@ async def cmd_essay(message: Message, command: CommandObject) -> None:
         await message.answer(f"🔎 Генерирую разбор по своей теме (ниша: {ch.niche})… ~минуту.")
         res = await generate_essay(tweet_text=custom, author=None, niche=ch.niche,
                                    channel=ch.title, api_key=ANTHROPIC_KEY)
+        await st.record_cost(channel_id, uid, res.ok, res.total_searches,
+                             res.tokens_in, res.tokens_out)
         if not res.ok:
             await st.refund_essay(uid)
             await message.answer(f"⚠️ Не получилось: {res.error}")
@@ -478,6 +522,8 @@ async def cb_pick(cq: CallbackQuery) -> None:
     await cq.message.edit_text(f"🔎 Генерирую разбор по @{cand.author} (ниша: {cand.niche})… ~минуту.")
     res = await generate_essay(tweet_text=cand.text, author=cand.author, niche=cand.niche,
                                channel=cand.title, api_key=ANTHROPIC_KEY)
+    await st.record_cost(cand.channel_id, cq.from_user.id, res.ok,
+                         res.total_searches, res.tokens_in, res.tokens_out)
     if not res.ok:
         await st.refund_essay(cq.from_user.id)
         await cq.message.answer(f"⚠️ Не получилось: {res.error}")
@@ -537,6 +583,8 @@ async def cb_angle(cq: CallbackQuery) -> None:
     await cq.answer("Перегенерирую…")
     res = await generate_essay(tweet_text=d.tweet_text, author=d.author, niche=d.niche,
                                channel=d.title, api_key=ANTHROPIC_KEY)
+    await st.record_cost(d.channel_id, cq.from_user.id, res.ok,
+                         res.total_searches, res.tokens_in, res.tokens_out)
     if not res.ok:
         await st.refund_essay(cq.from_user.id)
         await st.apply_revision(did, d.draft, d.violations)
@@ -681,6 +729,8 @@ async def _timer_send(bot: Bot, chat_id: int, cand, owner_user_id: int) -> bool:
         return False, None
     res = await generate_essay(tweet_text=cand.text, author=cand.author, niche=cand.niche,
                                channel=cand.title, api_key=ANTHROPIC_KEY)
+    await st.record_cost(cand.channel_id, owner_user_id, res.ok,
+                         res.total_searches, res.tokens_in, res.tokens_out)
     if not res.ok:
         await st.refund_essay(owner_user_id)
         log.warning("timer: генерация не удалась «%s»: %s", cand.title, res.error)
