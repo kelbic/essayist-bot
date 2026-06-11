@@ -160,6 +160,11 @@ class Store:
         ucols = {r[1] for r in await cur.fetchall()}
         if "expires_at" not in ucols:
             await db.execute("ALTER TABLE essayist_users ADD COLUMN expires_at TEXT")
+        if "plan" not in ucols:
+            await db.execute("ALTER TABLE essayist_users ADD COLUMN plan TEXT DEFAULT 'manual'")
+        if "essays_used" not in ucols:
+            await db.execute(
+                "ALTER TABLE essayist_users ADD COLUMN essays_used INTEGER NOT NULL DEFAULT 0")
 
     async def create_draft(self, *, channel_id, tweet_id, tweet_text, author, niche,
                            target_chat_id, title, brief, draft, violations,
@@ -307,6 +312,88 @@ class Store:
         if not row or not row[0]:
             return False
         return _not_expired(row[1])
+
+    # ------------------------------------------------ квоты и триал (этап D)
+    # plan: 'trial' (7д/20), 'paid' (30д/30), 'manual' (выдан руками: без квоты).
+    PLAN_QUOTA = {"trial": 20, "paid": 30}
+
+    async def ensure_trial(self, user_id: int, days: int = 7) -> bool:
+        """Авто-триал при первом контакте. True — триал только что выдан.
+
+        Сам факт строки в essayist_users = триал уже использован: повторный
+        триал после истечения НЕ выдаётся (вернёт False, ничего не меняя).
+        """
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute(
+                "INSERT INTO essayist_users(user_id, enabled, note, granted_at, "
+                "expires_at, plan, essays_used) "
+                "VALUES(?,1,'auto-trial',?,?,'trial',0) "
+                "ON CONFLICT(user_id) DO NOTHING",
+                (user_id, _now(), _now_plus_days(days)))
+            await db.commit()
+            return cur.rowcount > 0
+
+    async def quota_state(self, user_id: int) -> tuple[str, int, int, str | None]:
+        """(plan, used, quota, expires_at). quota=-1 — безлимит (manual/нет строки)."""
+        async with aiosqlite.connect(self.db_path) as db:
+            row = await (await db.execute(
+                "SELECT plan, essays_used, expires_at FROM essayist_users "
+                "WHERE user_id=?", (user_id,))).fetchone()
+        if not row:
+            return ("none", 0, -1, None)
+        plan = row[0] or "manual"
+        quota = self.PLAN_QUOTA.get(plan, -1)
+        return (plan, int(row[1] or 0), quota, row[2])
+
+    async def consume_essay(self, user_id: int) -> tuple[bool, int, int]:
+        """Атомарно списывает 1 разбор. (ok, used_after, quota).
+
+        manual-план (выдан руками) — без квоты, всегда ok. Превышение —
+        (False, used, quota), счётчик не растёт.
+        """
+        async with aiosqlite.connect(self.db_path) as db:
+            row = await (await db.execute(
+                "SELECT plan, essays_used FROM essayist_users WHERE user_id=?",
+                (user_id,))).fetchone()
+            if not row:
+                return (False, 0, 0)
+            plan = row[0] or "manual"
+            quota = self.PLAN_QUOTA.get(plan, -1)
+            if quota < 0:
+                return (True, int(row[1] or 0), -1)
+            cur = await db.execute(
+                "UPDATE essayist_users SET essays_used = essays_used + 1 "
+                "WHERE user_id=? AND essays_used < ?", (user_id, quota))
+            await db.commit()
+            if cur.rowcount == 0:
+                return (False, int(row[1] or 0), quota)
+            return (True, int(row[1] or 0) + 1, quota)
+
+    async def activate_paid(self, user_id: int, days: int = 30) -> str:
+        """Оплата: +days от конца текущего срока (или от now), квота 30, счётчик 0."""
+        async with aiosqlite.connect(self.db_path) as db:
+            row = await (await db.execute(
+                "SELECT expires_at FROM essayist_users WHERE user_id=?",
+                (user_id,))).fetchone()
+        base = datetime.now(timezone.utc)
+        if row and row[0]:
+            try:
+                cur_exp = datetime.fromisoformat(row[0])
+                if cur_exp.tzinfo is None:
+                    cur_exp = cur_exp.replace(tzinfo=timezone.utc)
+                base = max(base, cur_exp)
+            except ValueError:
+                pass
+        new_exp = (base + timedelta(days=days)).isoformat()
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                "INSERT INTO essayist_users(user_id, enabled, note, granted_at, "
+                "expires_at, plan, essays_used) VALUES(?,1,'paid',?,?,'paid',0) "
+                "ON CONFLICT(user_id) DO UPDATE SET enabled=1, plan='paid', "
+                "essays_used=0, expires_at=?, note='paid'",
+                (user_id, _now(), new_exp, new_exp))
+            await db.commit()
+        return new_exp
 
     async def set_user_enabled(self, user_id: int, enabled: bool, note: str | None = None,
                                days: int | None = None) -> None:
