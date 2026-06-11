@@ -315,7 +315,7 @@ class Store:
 
     # ------------------------------------------------ квоты и триал (этап D)
     # plan: 'trial' (7д/20), 'paid' (30д/30), 'manual' (выдан руками: без квоты).
-    PLAN_QUOTA = {"trial": 20, "paid": 30}
+    PLAN_QUOTA = {"trial": 20, "paid": 20}
 
     async def ensure_trial(self, user_id: int, days: int = 7) -> bool:
         """Авто-триал при первом контакте. True — триал только что выдан.
@@ -368,6 +368,14 @@ class Store:
             if cur.rowcount == 0:
                 return (False, int(row[1] or 0), quota)
             return (True, int(row[1] or 0) + 1, quota)
+
+    async def refund_essay(self, user_id: int) -> None:
+        """Возврат списания (генерация не удалась). Безопасно для любых планов."""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                "UPDATE essayist_users SET essays_used = MAX(essays_used - 1, 0) "
+                "WHERE user_id=?", (user_id,))
+            await db.commit()
 
     async def activate_paid(self, user_id: int, days: int = 30) -> str:
         """Оплата: +days от конца текущего срока (или от now), квота 30, счётчик 0."""

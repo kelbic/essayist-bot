@@ -24,7 +24,9 @@ from aiogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    LabeledPrice,
     Message,
+    PreCheckoutQuery,
 )
 from dotenv import load_dotenv
 
@@ -56,7 +58,34 @@ INTERVAL_CHOICES = (3, 6, 9, 12, 24)
 
 NO_ACCESS_CHANNEL = "Нет доступа к этому каналу — он не твой."
 NO_ACCESS_DRAFT = "Нет доступа к этому черновику."
-NO_PRO = "Доступ к Essayist Pro не активирован. Обратись к администратору."
+NO_PRO = ("Доступ не активен: триал закончился или ещё не выдавался "
+          "(он включается автоматически на /start).\n"
+          "Дальше — по подписке, кнопка ниже.")
+
+PRICE_STARS_ESSAY = 1490
+PAID_DAYS = 30
+PAID_QUOTA = 20
+
+
+def _buy_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
+        text=f"💳 {PAID_DAYS} дней · {PAID_QUOTA} разборов — {PRICE_STARS_ESSAY}⭐",
+        callback_data="esbuy")]])
+
+
+async def _quota_take(uid: int) -> tuple[bool, str]:
+    """Списать 1 разбор перед генерацией. (ok, текст_отказа)."""
+    if _is_admin(uid):
+        return True, ""
+    ok, used, quota = await st.consume_essay(uid)
+    if ok:
+        return True, ""
+    plan, used, quota, _exp = await st.quota_state(uid)
+    return False, (
+        f"📉 Лимит разборов исчерпан: {used}/{quota} за период.\n"
+        f"Продолжить — {PRICE_STARS_ESSAY}⭐ за {PAID_DAYS} дней "
+        f"({PAID_QUOTA} разборов)."
+    )
 NEED_ADMIN_RIGHTS = ("Бот не админ этого канала (или без права постинга). "
                      "Добавь @essayist_bot админом с правом Post Messages — потом включи.")
 
@@ -187,13 +216,22 @@ def _card(cand_title: str, author: str | None, niche: str, res) -> str:
 async def cmd_start(message: Message, command: CommandObject) -> None:
     uid = message.from_user.id
     await st.mark_started(uid)  # теперь таймер сможет писать этому владельцу первым
+    just_granted = False
+    if not _is_admin(uid):
+        just_granted = await st.ensure_trial(uid)  # авто-триал, ровно один раз
     if await auth.is_entitled(st, uid, ADMIN):
         suffix = ""
-        if not _is_admin(uid):
-            ent = await st.get_entitlement(uid)
-            dleft = _days_left(ent["expires_at"]) if ent else None
-            if dleft is not None:
-                suffix = f"\n\nДоступ (бета): осталось {dleft} дн. Продлить — напиши @kelbic."
+        if just_granted:
+            suffix = (f"\n\n🎁 Включил триал: 7 дней и 20 разборов — без карты. "
+                      f"Дальше — {PRICE_STARS_ESSAY}⭐ за {PAID_DAYS} дней.")
+        elif not _is_admin(uid):
+            plan, used, quota, exp = await st.quota_state(uid)
+            dleft = _days_left(exp) if exp else None
+            if quota >= 0:
+                suffix = (f"\n\n📊 Разборов: {used}/{quota}"
+                          + (f", осталось {dleft} дн." if dleft is not None else ""))
+            elif dleft is not None:
+                suffix = f"\n\nДоступ: осталось {dleft} дн."
         await message.answer(
             "Привет! Essayist Pro активирован.\n\n"
             "• /essay <id> — собрать разбор по теме канала (или своей)\n"
@@ -203,8 +241,44 @@ async def cmd_start(message: Message, command: CommandObject) -> None:
     else:
         await message.answer(
             "Привет! Это Essayist — бот авторских разборов для каналов.\n\n"
-            "Доступ к Essayist Pro пока не активирован. Когда администратор выдаст доступ, "
-            "тебе станут доступны /essay и /timer.")
+            "Твой триал уже использован, доступ закончился. Продолжить — "
+            f"{PRICE_STARS_ESSAY}⭐ за {PAID_DAYS} дней ({PAID_QUOTA} разборов).",
+            reply_markup=_buy_kb())
+
+
+@dp.callback_query(F.data == "esbuy")
+async def cb_esbuy(cq: CallbackQuery) -> None:
+    await cq.answer()
+    await cq.bot.send_invoice(
+        chat_id=cq.from_user.id,
+        title=f"Essayist — {PAID_DAYS} дней",
+        description=(f"{PAID_QUOTA} авторских разборов с веб-ресёрчем, "
+                     f"HIL-редактурой и автоподбором по таймеру."),
+        payload="essayist:30d",
+        currency="XTR",
+        prices=[LabeledPrice(label=f"{PAID_QUOTA} разборов / {PAID_DAYS} дней",
+                             amount=PRICE_STARS_ESSAY)],
+    )
+
+
+@dp.pre_checkout_query()
+async def on_pre_checkout(pcq: PreCheckoutQuery) -> None:
+    await pcq.answer(ok=pcq.invoice_payload.startswith("essayist:"))
+
+
+@dp.message(F.successful_payment)
+async def on_paid(message: Message) -> None:
+    sp = message.successful_payment
+    if not sp or not (sp.invoice_payload or "").startswith("essayist:"):
+        return
+    uid = message.from_user.id
+    new_exp = await st.activate_paid(uid, days=PAID_DAYS)
+    log.info("payment: essayist paid by %d (%d stars, charge %s), until %s",
+             uid, sp.total_amount, sp.telegram_payment_charge_id, new_exp)
+    await message.answer(
+        f"✅ Оплата получена! Доступ на {PAID_DAYS} дней, "
+        f"квота {PAID_QUOTA} разборов.\n"
+        f"Статус всегда в /start. Спасибо!")
 
 
 @dp.message(Command("grant"))
@@ -297,7 +371,7 @@ async def cmd_help(message: Message, command: CommandObject) -> None:
 async def cmd_essay(message: Message, command: CommandObject) -> None:
     uid = message.from_user.id
     if not await auth.is_entitled(st, uid, ADMIN):
-        await message.answer(NO_PRO)
+        await message.answer(NO_PRO, reply_markup=_buy_kb())
         return
     arg = (command.args or "").strip()
     if not arg:
@@ -329,10 +403,15 @@ async def cmd_essay(message: Message, command: CommandObject) -> None:
     custom = "" if (not rest or show_all) else rest.strip(' "«»')
 
     if custom:
+        ok_q, deny = await _quota_take(uid)
+        if not ok_q:
+            await message.answer(deny, reply_markup=_buy_kb())
+            return
         await message.answer(f"🔎 Генерирую разбор по своей теме (ниша: {ch.niche})… ~минуту.")
         res = await generate_essay(tweet_text=custom, author=None, niche=ch.niche,
                                    channel=ch.title, api_key=ANTHROPIC_KEY)
         if not res.ok:
+            await st.refund_essay(uid)
             await message.answer(f"⚠️ Не получилось: {res.error}")
             return
         did = await st.create_draft(
@@ -386,11 +465,17 @@ async def cb_pick(cq: CallbackQuery) -> None:
     if not cand.target_chat_id:
         return await cq.answer("У канала нет target_chat_id.", show_alert=True)
     owner = ch.user_id
+    ok_q, deny = await _quota_take(cq.from_user.id)
+    if not ok_q:
+        await cq.answer("Лимит разборов исчерпан", show_alert=True)
+        await cq.message.answer(deny, reply_markup=_buy_kb())
+        return
     await cq.answer("Запускаю генерацию…")
     await cq.message.edit_text(f"🔎 Генерирую разбор по @{cand.author} (ниша: {cand.niche})… ~минуту.")
     res = await generate_essay(tweet_text=cand.text, author=cand.author, niche=cand.niche,
                                channel=cand.title, api_key=ANTHROPIC_KEY)
     if not res.ok:
+        await st.refund_essay(cq.from_user.id)
         await cq.message.answer(f"⚠️ Не получилось: {res.error}")
         return
     did = await st.create_draft(
@@ -440,10 +525,16 @@ async def cb_angle(cq: CallbackQuery) -> None:
     if not await st.begin_revision(did):
         return await cq.answer("Сейчас нельзя (уже опубликовано/отклонено).", show_alert=True)
     d = await st.get(did)
+    ok_q, deny = await _quota_take(cq.from_user.id)
+    if not ok_q:
+        await st.apply_revision(did, d.draft, d.violations)  # откат begin_revision
+        await cq.answer("Лимит разборов исчерпан", show_alert=True)
+        return await cq.message.answer(deny, reply_markup=_buy_kb())
     await cq.answer("Перегенерирую…")
     res = await generate_essay(tweet_text=d.tweet_text, author=d.author, niche=d.niche,
                                channel=d.title, api_key=ANTHROPIC_KEY)
     if not res.ok:
+        await st.refund_essay(cq.from_user.id)
         await st.apply_revision(did, d.draft, d.violations)
         return await cq.message.answer(f"⚠️ Перегенерация не вышла: {res.error}")
     await st.apply_revision(did, res.draft, res.violations)
@@ -532,7 +623,7 @@ async def _safe_edit(message: Message, text: str, kb: InlineKeyboardMarkup) -> N
 async def cmd_timer(message: Message, command: CommandObject) -> None:
     uid = message.from_user.id
     if not await auth.is_entitled(st, uid, ADMIN):
-        await message.answer(NO_PRO)
+        await message.answer(NO_PRO, reply_markup=_buy_kb())
         return
     text, kb = await _timer_panel(uid)
     await message.answer(text, reply_markup=kb)
@@ -579,9 +670,15 @@ async def cb_esfreq(cq: CallbackQuery) -> None:
 
 async def _timer_send(bot: Bot, chat_id: int, cand, owner_user_id: int) -> bool:
     """Сгенерировать разбор и отправить карточку владельцу. True если карточка ушла."""
+    ok_q, _deny = await _quota_take(owner_user_id)
+    if not ok_q:
+        log.info("timer: квота владельца %d исчерпана — пропускаю «%s»",
+                 owner_user_id, cand.title)
+        return False, None
     res = await generate_essay(tweet_text=cand.text, author=cand.author, niche=cand.niche,
                                channel=cand.title, api_key=ANTHROPIC_KEY)
     if not res.ok:
+        await st.refund_essay(owner_user_id)
         log.warning("timer: генерация не удалась «%s»: %s", cand.title, res.error)
         return False, res
     did = await st.create_draft(
