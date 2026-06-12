@@ -748,28 +748,29 @@ async def _timer_send(bot: Bot, chat_id: int, cand, owner_user_id: int) -> bool:
     return True, res
 
 
-async def run_timer_tick(bot: Bot) -> None:
+# Одновременных генераций в тике. Узкие места при росте: rate-limit ключа
+# Anthropic (429 ловятся ретраями _Anthropic, но зачем их провоцировать) и
+# флуд-лимиты Telegram при доставке владельцам. 3 — безопасно; при 50+ каналах
+# тик ~50×75с/3 ≈ 21 мин, что нормально: timer_loop спит ПОСЛЕ тика, наложений нет.
+TIMER_CONCURRENCY = 3
+
+
+async def _tick_channel(bot: Bot, cfg: dict) -> None:
+    """Полный тик ОДНОГО канала. Изолирован: любое падение — лог + last_error
+    канала, остальные каналы тика не страдают."""
+    cid = cfg["channel_id"]
+    owner = cfg["user_id"]
     try:
-        rows = await st.enabled_essay_channels()
-    except Exception:
-        log.exception("timer: чтение essay_config не удалось")
-        return
-    now = datetime.now(timezone.utc)
-    for cfg in rows:
-        cid = cfg["channel_id"]
-        owner = cfg["user_id"]
-        if not _is_due(cfg.get("last_run_at"), cfg.get("frequency_hours", DEFAULT_FREQ_HOURS), now):
-            continue
         try:
             ch = await candidates.get_channel(TWIDGEST_DB, cid)
             if not ch or not ch.target_chat_id:
                 await st.set_essay_error(cid, "канал пропал из twidgest или без target_chat_id")
-                continue
+                return
             cands = await candidates.top_candidates(TWIDGEST_DB, cid, limit=10,
                                                     max_age_hours=FRESH_HOURS)
         except Exception:
             log.exception("timer: кандидаты не прочитались для %s", cid)
-            continue
+            return
         eligible = []
         for c in cands:
             if not c.target_chat_id:
@@ -780,7 +781,7 @@ async def run_timer_tick(bot: Bot) -> None:
                 continue
             eligible.append(c)
         if not eligible:
-            continue  # свежих новых тем нет — ждём следующего тика, ничего не тратим
+            return  # свежих новых тем нет — ждём следующего тика, ничего не тратим
         # предохранитель доставки (один раз на канал, до генерации)
         try:
             await bot.send_chat_action(owner, "typing")
@@ -791,7 +792,7 @@ async def run_timer_tick(bot: Bot) -> None:
                 msg = f"не доставить владельцу: {exc}"
             log.warning("timer: владелец %s недоступен (канал %s): %s", owner, cid, msg)
             await st.set_essay_error(cid, msg)
-            continue
+            return
         # пробуем до MAX_PICK_ATTEMPTS кандидатов: непоисковые метим skip и идём дальше
         delivered = False
         stop_transient = False
@@ -816,6 +817,36 @@ async def run_timer_tick(bot: Bot) -> None:
         if not delivered and not stop_transient:
             await st.touch_essay_run(cid)
             await st.set_essay_error(cid, "подряд непоисковые темы — пропуск тика")
+    except Exception:
+        log.exception("timer: канал %s упал в тике", cid)
+        try:
+            await st.set_essay_error(cid, "внутренняя ошибка тика")
+        except Exception:
+            pass
+
+
+async def run_timer_tick(bot: Bot) -> None:
+    try:
+        rows = await st.enabled_essay_channels()
+    except Exception:
+        log.exception("timer: чтение essay_config не удалось")
+        return
+    now = datetime.now(timezone.utc)
+    due = [cfg for cfg in rows
+           if _is_due(cfg.get("last_run_at"),
+                      cfg.get("frequency_hours", DEFAULT_FREQ_HOURS), now)]
+    if not due:
+        return
+    started = asyncio.get_event_loop().time()
+    sem = asyncio.Semaphore(TIMER_CONCURRENCY)
+
+    async def _guarded(cfg: dict) -> None:
+        async with sem:
+            await _tick_channel(bot, cfg)
+
+    await asyncio.gather(*(_guarded(cfg) for cfg in due))
+    log.info("timer: тик обработал %d каналов за %.0f с (конкурентность %d)",
+             len(due), asyncio.get_event_loop().time() - started, TIMER_CONCURRENCY)
 
 
 async def timer_loop(bot: Bot) -> None:
