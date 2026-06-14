@@ -767,7 +767,8 @@ async def _tick_channel(bot: Bot, cfg: dict) -> None:
                 await st.set_essay_error(cid, "канал пропал из twidgest или без target_chat_id")
                 return
             cands = await candidates.top_candidates(TWIDGEST_DB, cid, limit=10,
-                                                    max_age_hours=FRESH_HOURS)
+                                                    max_age_hours=FRESH_HOURS,
+                                                    strict_topic=True)
         except Exception:
             log.exception("timer: кандидаты не прочитались для %s", cid)
             return

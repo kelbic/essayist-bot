@@ -72,18 +72,27 @@ async def channels_for_user(db_path: str, user_id: int) -> list[ChannelInfo]:
 
 
 async def top_candidates(db_path: str, channel_id: int, limit: int = 5,
-                         max_age_hours: int | None = None) -> list[Candidate]:
+                         max_age_hours: int | None = None,
+                         strict_topic: bool = False) -> list[Candidate]:
     """Топ-N виральных твитов канала по (likes + retweets*3).
 
     max_age_hours: окно свежести по queued_at. None = без окна (любой возраст) —
     так работает ручной /essay. Автоподбор передаёт окно (берёт только свежее),
     чтобы залайканное старьё не всплывало само. int() защищает datetime-модификатор
     от инъекции (его нельзя забиндить плейсхолдером).
+
+    strict_topic: для АВТОподбора. Берёт только темы, которые ранкер twidgest
+    оценил (interest_score IS NOT NULL) и оценил не ниже порога канала
+    (>= c.min_interest). Неоценённое (NULL) автоматически НЕ берём — оффтоп
+    вроде виральной геополитики так не всплывает сам; человек закажет такую тему
+    руками через /essay. Ручной путь strict_topic не передаёт (любая тема разрешена).
     """
     where = "WHERE q.channel_id = ? "
     params: list = [channel_id]
     if max_age_hours is not None:
         where += f"AND q.queued_at >= datetime('now', '-{int(max_age_hours)} hours') "
+    if strict_topic:
+        where += "AND q.interest_score IS NOT NULL AND q.interest_score >= c.min_interest "
     sql = _SELECT + where + "ORDER BY (q.likes + q.retweets * 3) DESC LIMIT ?"
     params.append(limit)
     async with aiosqlite.connect(_ro_uri(db_path), uri=True) as db:
@@ -92,8 +101,10 @@ async def top_candidates(db_path: str, channel_id: int, limit: int = 5,
 
 
 async def top_candidate(db_path: str, channel_id: int,
-                        max_age_hours: int | None = None) -> Candidate | None:
-    res = await top_candidates(db_path, channel_id, limit=1, max_age_hours=max_age_hours)
+                        max_age_hours: int | None = None,
+                        strict_topic: bool = False) -> Candidate | None:
+    res = await top_candidates(db_path, channel_id, limit=1,
+                               max_age_hours=max_age_hours, strict_topic=strict_topic)
     return res[0] if res else None
 
 
