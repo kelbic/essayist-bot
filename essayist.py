@@ -284,24 +284,39 @@ async def _critique(critic, tweet, brief, draft):
     return _parse_json(await critic.call(CRITIC_SYSTEM, user, 1500, 0.0))
 
 
-async def _revise(writer, tweet, brief, draft, violations, channel, niche, length_rule):
+async def _revise(writer, tweet, brief, draft, violations, channel, niche, length_rule,
+                  partial: bool = False):
     vtext = "\n".join(f"- [{v.get('type')}] «{v.get('quote')}» — {v.get('why')}" for v in violations)
+    # partial_rule ОБЯЗАТЕЛЕН и тут: без него ревизия сглаживает границу знания
+    # первого черновика и выдаёт неподтверждённое как факт.
     user = (f"ИСХОДНЫЙ ТВИТ:\n{tweet}\n\nБРИФ:\n{brief}\n\nТЕКУЩИЙ ЧЕРНОВИК:\n{draft}\n\n"
-            f"РЕДАКТОР НАШЁЛ НАРУШЕНИЯ — исправь ТОЛЬКО их, остальной текст сохрани:\n{vtext}\n\n"
-            "Верни исправленный разбор целиком, без пояснений.")
+            f"РЕДАКТОР НАШЁЛ НАРУШЕНИЯ — исправь ТОЛЬКО их, остальной текст сохрани:\n{vtext}"
+            f"{_partial_rule(partial)}\n\n"
+            "Верни исправленный разбор целиком, без пояснений. Сохрани все пометки о "
+            "неподтверждённости из текущего черновика — НЕ превращай их в утверждения.")
     return await writer.call(_drafter_system(niche, channel, length_rule), user, 3500, 0.4)
 
 
+def _partial_rule(partial: bool) -> str:
+    """Эпистемическое ограничение для тем с неподтверждённым ключевым утверждением.
+    Используется И в _draft, И в _revise — иначе ревизия сбрасывает осторожность
+    первого черновика и выдаёт неподтверждённое как факт (реальный баг: на «своей
+    теме» с вирусным непроверяемым нарративом revise писал слухи как установленное)."""
+    if not partial:
+        return ""
+    return (
+        "\n\nРЕЖИМ «ЧАСТИЧНАЯ ВЕРИФИКАЦИЯ»: ключевое утверждение твита не "
+        "подтвердилось поиском (см. строку «НЕ ПОДТВЕРЖДЕНО» брифа). Пиши разбор "
+        "по подтверждённым фактам о реальном предмете, и отдельным абзацем ближе "
+        "к началу честно обозначь: какое утверждение разошлось по сети и что его "
+        "первоисточник не находится. Без слов «фейк», «ложь», «дезинформация» — "
+        "только граница знания. Остальной текст — о подтверждённом. КРИТИЧНО: "
+        "неподтверждённые числа и детали (зарплаты, доли, оценки) НЕ подавай как "
+        "факт — только с явной пометкой, что первоисточник не найден.")
+
+
 async def _draft(writer, tweet, brief, channel, niche, length_rule, partial: bool = False):
-    partial_rule = ""
-    if partial:
-        partial_rule = (
-            "\n\nРЕЖИМ «ЧАСТИЧНАЯ ВЕРИФИКАЦИЯ»: ключевое утверждение твита не "
-            "подтвердилось поиском (см. строку «НЕ ПОДТВЕРЖДЕНО» брифа). Пиши разбор "
-            "по подтверждённым фактам о реальном предмете, и отдельным абзацем ближе "
-            "к началу честно обозначь: какое утверждение разошлось по сети и что его "
-            "первоисточник не находится. Без слов «фейк», «ложь», «дезинформация» — "
-            "только граница знания. Остальной текст — о подтверждённом.")
+    partial_rule = _partial_rule(partial)
     user = (f"ИСХОДНЫЙ ТВИТ (сигнал темы):\n{tweet}\n\n"
             f"БРИФ ПРОВЕРЕННОЙ ФАКТУРЫ (единственный источник фактов):\n{brief}\n\n"
             f"Канал для подвала: {channel}{partial_rule}\n\nНапиши разбор. Начни сразу с хука.")
@@ -392,7 +407,8 @@ async def generate_essay(
         crit = await _critique(strong, tweet, brief, draft)
         violations = crit.get("violations", []) or []
         if violations and crit.get("verdict") == "revise":
-            fixed = await _revise(strong, tweet, brief, draft, violations, channel, niche, length_rule)
+            fixed = await _revise(strong, tweet, brief, draft, violations, channel, niche, length_rule,
+                                  partial=partial)
             if fixed:
                 draft = fixed
 
