@@ -37,6 +37,38 @@ from essayist import generate_essay
 
 load_dotenv()
 ADMIN = int(os.environ.get("ADMIN_USER_ID", "0"))
+
+# Антифлуд для алертов админу об инфра-ошибках (мёртвая модель/API).
+# Не чаще раза в 10 минут — чтобы шквал ошибок не завалил админа сотней сообщений.
+_last_infra_alert: float = 0.0
+_INFRA_ALERT_COOLDOWN = 600  # секунд
+
+
+async def _alert_admin_infra(bot, error: str) -> None:
+    """Шлёт админу алерт об инфра-ошибке (поломка модели/API) с антифлудом.
+    Контентные неудачи (поиск не нашёл) сюда НЕ попадают — только infra_error.
+    """
+    global _last_infra_alert
+    if ADMIN == 0:
+        return
+    now = time.time()
+    if now - _last_infra_alert < _INFRA_ALERT_COOLDOWN:
+        return  # недавно уже слали — не спамим
+    _last_infra_alert = now
+    try:
+        await bot.send_message(
+            ADMIN,
+            f"🚨 <b>Essayist: сбой генерации (инфраструктура)</b>\n\n"
+            f"Ошибка: <code>{error}</code>\n\n"
+            f"Вероятная причина: модель в .env устарела/недоступна, или API down. "
+            f"Проверь <code>ANTHROPIC_MODEL</code> и логи "
+            f"(<code>journalctl -u essayist-bot</code>). "
+            f"Разборы не генерируются, пока не починено.\n\n"
+            f"<i>(следующий такой алерт — не раньше чем через 10 мин)</i>",
+            parse_mode="HTML",
+        )
+    except Exception as exc:
+        log.error("не смог отправить инфра-алерт админу: %s", exc)
 TWIDGEST_DB = os.environ.get("TWIDGEST_DB", os.path.expanduser("~/twidgest-bot/twidgest.db"))
 ESSBOT_DB = os.environ.get("ESSBOT_DB", "essayist.db")
 ANTHROPIC_KEY = os.environ.get("ANTHROPIC_API_KEY")
@@ -461,6 +493,8 @@ async def cmd_essay(message: Message, command: CommandObject) -> None:
         if not res.ok:
             await st.refund_essay(uid)
             await message.answer(f"⚠️ Не получилось: {res.error}")
+            if res.infra_error:
+                await _alert_admin_infra(message.bot, res.error)
             return
         did = await st.create_draft(
             channel_id=channel_id, owner_user_id=owner,
@@ -527,6 +561,8 @@ async def cb_pick(cq: CallbackQuery) -> None:
     if not res.ok:
         await st.refund_essay(cq.from_user.id)
         await cq.message.answer(f"⚠️ Не получилось: {res.error}")
+        if res.infra_error:
+            await _alert_admin_infra(cq.bot, res.error)
         return
     did = await st.create_draft(
         channel_id=cand.channel_id, owner_user_id=owner, tweet_id=cand.tweet_id,
@@ -588,6 +624,8 @@ async def cb_angle(cq: CallbackQuery) -> None:
     if not res.ok:
         await st.refund_essay(cq.from_user.id)
         await st.apply_revision(did, d.draft, d.violations)
+        if res.infra_error:
+            await _alert_admin_infra(cq.bot, res.error)
         return await cq.message.answer(f"⚠️ Перегенерация не вышла: {res.error}")
     await st.apply_revision(did, res.draft, res.violations)
     await cq.message.answer(f"🔁 Заход №{d.revision_count + 1}:")
@@ -734,6 +772,8 @@ async def _timer_send(bot: Bot, chat_id: int, cand, owner_user_id: int) -> bool:
     if not res.ok:
         await st.refund_essay(owner_user_id)
         log.warning("timer: генерация не удалась «%s»: %s", cand.title, res.error)
+        if res.infra_error:
+            await _alert_admin_infra(bot, res.error)
         return False, res
     did = await st.create_draft(
         channel_id=cand.channel_id, owner_user_id=owner_user_id, tweet_id=cand.tweet_id,

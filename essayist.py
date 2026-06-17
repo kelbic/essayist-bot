@@ -33,6 +33,7 @@ class EssayResult:
     violations: list[dict] = field(default_factory=list)
     total_searches: int = 0
     error: str = ""
+    infra_error: bool = False  # True = поломка модели/API (нужен алерт админу), не контентная неудача
     tokens_in: int = 0
     tokens_out: int = 0
 
@@ -393,7 +394,7 @@ async def generate_essay(
 
     questions = await _plan(planner, tweet, max_questions)
     if not questions:
-        return _res(ok=False, error="планировщик не вернул вопросов")
+        return _res(ok=False, error="планировщик не вернул вопросов", infra_error=True)
 
     sem = asyncio.Semaphore(2)
 
@@ -404,14 +405,14 @@ async def generate_essay(
     results = await asyncio.gather(*[_guarded(q) for q in questions])
     total = sum(n for _, n in results)
     if total == 0:
-        return _res(ok=False, error="веб-поиск не выполнился ни разу (предохранитель)")
+        return _res(ok=False, error="веб-поиск не выполнился ни разу (предохранитель)", infra_error=True)
     findings = [(q, a) for q, (a, _) in zip(questions, results) if a]
     if not findings:
         return _res(ok=False, error="поиск не вернул текста")
 
     brief = await _synthesize(strong, tweet, findings)
     if not brief:
-        return _res(ok=False, error="синтез вернул пусто", total_searches=total)
+        return _res(ok=False, error="синтез вернул пусто", total_searches=total, infra_error=True)
     if brief.strip().upper().startswith("TOPIC_UNVERIFIED"):
         detail = brief.strip().split("\n", 1)
         why = detail[1].strip()[:300] if len(detail) > 1 else ""
@@ -435,7 +436,7 @@ async def generate_essay(
     draft = await _draft(strong, tweet, brief, channel, niche, length_rule,
                          partial=partial)
     if not draft:
-        return _res(ok=False, error="генератор вернул пусто", brief=brief, total_searches=total)
+        return _res(ok=False, error="генератор вернул пусто", brief=brief, total_searches=total, infra_error=True)
 
     violations: list[dict] = []
     if run_critic:
