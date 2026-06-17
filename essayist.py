@@ -12,7 +12,11 @@ from datetime import datetime
 import os
 from dataclasses import dataclass, field
 
+import logging
+
 import aiohttp
+
+logger = logging.getLogger("essayist")
 
 ANTHROPIC_URL = "https://api.anthropic.com/v1/messages"
 ANTHROPIC_VERSION = "2023-06-01"
@@ -77,12 +81,21 @@ class _Anthropic:
                         if r.status == 200:
                             return json.loads(body)
                         if r.status not in RETRYABLE_HTTP:
+                            logger.error(
+                                "Anthropic API non-retryable error: model=%s "
+                                "status=%d body=%s",
+                                self.model, r.status, body[:300],
+                            )
                             return None
                         last = f"HTTP {r.status}"
             except (aiohttp.ClientError, asyncio.TimeoutError, KeyError, ValueError) as exc:
                 last = f"{type(exc).__name__}: {exc}"
             if attempt < self.max_attempts:
                 await asyncio.sleep(self.base_delay * (2 ** (attempt - 1)))
+        logger.error(
+            "Anthropic API failed after %d attempts: model=%s last=%s",
+            self.max_attempts, self.model, last,
+        )
         return None
 
     @staticmethod
