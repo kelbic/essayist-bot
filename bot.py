@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import logging
 import os
 import time
@@ -215,6 +216,60 @@ def _chunks(text: str, size: int = TG_LIMIT) -> list[str]:
     if cur:
         out.append(cur)
     return out or [""]
+
+
+# ── Атрибуция витрины (зеркало twidgest core/attribution) ────────────────────────────
+# Подпись «→ Источник · Собрано @TwidgestBot» ведёт на deep-link src_c<channel_id>:
+# регистрации с витрины учитывает /start twidgest (users.start_source).
+TWIDGEST_BOT = os.environ.get("TWIDGEST_BOT_USERNAME", "TwidgestBot")
+_ATTR_MODES = ("off", "digest_only", "all_posts")
+
+
+def _attr_mode(info: dict | None, now: datetime | None = None) -> str:
+    """Явный режим канала или авто: витрина админа/триал — all_posts, оплачен — off."""
+    if not info:
+        return "off"
+    explicit = (info.get("attribution_mode") or "").strip().lower()
+    if explicit in _ATTR_MODES:
+        return explicit
+    if info.get("user_id") == ADMIN:
+        return "all_posts"
+    paid = info.get("paid_until")
+    if paid:
+        try:
+            now = now or datetime.utcnow()
+            if datetime.fromisoformat(str(paid)) > now:
+                return "off"
+        except ValueError:
+            pass
+    return "all_posts"
+
+
+def _footer_html(d, info: dict | None) -> str:
+    """Подпись для разбора (это single-пост: digest_only/off — без подписи)."""
+    if _attr_mode(info) != "all_posts":
+        return ""
+    link = f"https://t.me/{TWIDGEST_BOT}?start=src_c{int(d.channel_id)}"
+    collected = f'<a href="{link}">Собрано @{TWIDGEST_BOT}</a>'
+    if d.author and d.tweet_id and not str(d.tweet_id).startswith("custom:"):
+        src = f"https://x.com/{d.author}/status/{d.tweet_id}"
+        return f'<a href="{html.escape(src)}">→ Источник</a> · {collected}'
+    return collected
+
+
+def _publish_parts(draft: str, footer: str) -> list[tuple[str, str | None]]:
+    """Куски публикации: [(текст, parse_mode)]. Разбор — простой текст; кусок с подписью
+    уходит в HTML, поэтому сам текст экранируется (буквы те же, ссылки кликабельны).
+    Не влезает с подписью в лимит — подпись отдельным сообщением."""
+    parts: list[tuple[str, str | None]] = [(c, None) for c in _chunks(draft)]
+    if not footer:
+        return parts
+    last = f"{html.escape(parts[-1][0])}\n\n{footer}"
+    if len(last) <= TG_LIMIT:
+        parts[-1] = (last, "HTML")
+    else:
+        parts.append((footer, "HTML"))
+    return parts
 
 
 def _kb_main(did: int) -> InlineKeyboardMarkup:
@@ -587,9 +642,15 @@ async def cb_pub(cq: CallbackQuery) -> None:
     if not await st.claim_for_publish(did):
         return await cq.answer("Уже опубликовано или в процессе.", show_alert=True)
     try:
+        try:
+            info = await candidates.channel_attribution(TWIDGEST_DB, d.channel_id)
+        except Exception:
+            log.exception("attribution: канал %s не прочитан — публикую без подписи", d.channel_id)
+            info = None
         first_id = None
-        for ch in _chunks(d.draft):
-            m = await cq.bot.send_message(d.target_chat_id, ch)
+        for ch, mode in _publish_parts(d.draft, _footer_html(d, info)):
+            m = await cq.bot.send_message(d.target_chat_id, ch, parse_mode=mode,
+                                          disable_web_page_preview=True)
             first_id = first_id or m.message_id
         await st.finalize_publish(did, first_id)
         await cq.message.edit_reply_markup(reply_markup=None)
@@ -775,6 +836,14 @@ async def _timer_send(bot: Bot, chat_id: int, cand, owner_user_id: int) -> bool:
         if res.infra_error:
             await _alert_admin_infra(bot, res.error)
         return False, res
+    if any(v.get("type") == "low_substance" for v in res.violations or []):
+        # Substance Gate: автоподбор пустой тизер владельцу не несёт — тема в skip,
+        # квота назад, тик пробует следующую. Ручной /essay показывает это в карточке.
+        await st.refund_essay(owner_user_id)
+        await st.mark_skipped(cand.channel_id, cand.tweet_id, "rejected_low_substance")
+        log.info("timer: «%s» @%s — rejected_low_substance, пробую следующую",
+                 cand.title, cand.author)
+        return False, res
     did = await st.create_draft(
         channel_id=cand.channel_id, owner_user_id=owner_user_id, tweet_id=cand.tweet_id,
         tweet_text=cand.text, author=cand.author, niche=cand.niche,
@@ -839,6 +908,8 @@ async def _tick_channel(bot: Bot, cfg: dict) -> None:
         stop_transient = False
         for c in eligible[:MAX_PICK_ATTEMPTS]:
             ok, res = await _timer_send(bot, owner, c, owner)
+            if not ok and res is not None and res.ok:
+                continue  # сгенерировано, но отбраковано гейтом — тема в skip, следующая
             if ok:
                 await st.touch_essay_run(cid)
                 await st.set_essay_error(cid, None)

@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import json
 from datetime import datetime
 import os
@@ -23,6 +24,36 @@ ANTHROPIC_VERSION = "2023-06-01"
 RETRYABLE_HTTP = {408, 429, 500, 502, 503, 504, 529}
 DEFAULT_MODEL = "claude-sonnet-4-6"
 DEFAULT_FAST_MODEL = "claude-haiku-4-5"
+
+
+# ── Substance Gate (зеркало twidgest core/quality_gate.find_teaser_admission) ──────────
+# Essayist намеренно не импортирует twidgest — правила продублированы. Сильные
+# формулировки-заглушки («подробностей в твите нет», «автор не уточнил») бракуют всегда,
+# слабая «пока неизвестно» — только в тексте без единой цифры.
+_NEG = r"(?:нет|не\s+(?:приводит|раскрыва|сообща|указ|уточн|дал|даёт|дает|называ))"
+_TEASER_STRONG = [re.compile(p, re.I) for p in (
+    rf"подробност\w*[^.!?\n]{{0,60}}?\b{_NEG}",
+    rf"детал\w*[^.!?\n]{{0,60}}?\b{_NEG}",
+    r"автор\w*\s+не\s+уточн",
+    r"информаци\w*[^.!?\n]{0,40}?\b(?:мало|нет|не\s+хватает)",
+    r"в\s+(?:самом\s+)?(?:твите|посте|сообщении|источнике)\s+не\s+"
+    r"(?:указ|сказ|раскрыв|уточн|приводит|назван|сообщ)",
+    r"(?:название|имя)\s+[^.!?\n]{0,30}?не\s+(?:указ|назван|раскрыв|сообщ|уточн)",
+)]
+_TEASER_WEAK = re.compile(r"пока\s+неизвестн", re.I)
+
+
+def find_teaser_admission(text: str) -> str | None:
+    """Фрагмент-заглушку, если текст — пустой тизер; иначе None."""
+    plain = text or ""
+    for rx in _TEASER_STRONG:
+        m = rx.search(plain)
+        if m:
+            return m.group(0)[:80]
+    m = _TEASER_WEAK.search(plain)
+    if m and not re.search(r"\d", plain):
+        return m.group(0)
+    return None
 
 
 @dataclass
@@ -448,4 +479,9 @@ async def generate_essay(
             if fixed:
                 draft = fixed
 
+    hit = find_teaser_admission(draft)
+    if hit:
+        violations = list(violations) + [{
+            "type": "low_substance", "quote": hit,
+            "why": "пустой тизер: текст признаёт, что подробностей нет (Substance Gate)"}]
     return _res(ok=True, brief=brief, draft=draft, violations=violations, total_searches=total)

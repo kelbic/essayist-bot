@@ -33,6 +33,13 @@ def _ro_uri(path: str) -> str:
     return f"file:{path}?mode=ro"
 
 
+async def _has_column(db, table: str, col: str) -> bool:
+    """Колонка есть в базе twidgest? Новые колонки (substance, attribution_mode) доливает
+    миграция twidgest на его рестарте — essayist не должен падать, если стартовал раньше."""
+    rows = await (await db.execute(f"PRAGMA table_info({table})")).fetchall()
+    return any(r[1] == col for r in rows)
+
+
 _SELECT = (
     "SELECT c.id, c.title, c.niche, c.target_chat_id, "
     "       q.tweet_id, q.twitter_username, q.text, q.url, q.likes, q.retweets "
@@ -93,9 +100,13 @@ async def top_candidates(db_path: str, channel_id: int, limit: int = 5,
         where += f"AND q.queued_at >= datetime('now', '-{int(max_age_hours)} hours') "
     if strict_topic:
         where += "AND q.interest_score IS NOT NULL AND q.interest_score >= c.min_interest "
-    sql = _SELECT + where + "ORDER BY (q.likes + q.retweets * 3) DESC LIMIT ?"
-    params.append(limit)
     async with aiosqlite.connect(_ro_uri(db_path), uri=True) as db:
+        if strict_topic and await _has_column(db, "digest_queue", "substance"):
+            # Substance Gate twidgest: тизер/безымянная новость сама не всплывает
+            # (NULL = ранкер оценил до появления гейта — берём)
+            where += "AND COALESCE(q.substance, 'ok') = 'ok' "
+        sql = _SELECT + where + "ORDER BY (q.likes + q.retweets * 3) DESC LIMIT ?"
+        params.append(limit)
         rows = await (await db.execute(sql, params)).fetchall()
     return [_row_to_candidate(r) for r in rows]
 
@@ -122,3 +133,17 @@ async def get_channel(db_path: str, channel_id: int) -> ChannelInfo | None:
     async with aiosqlite.connect(_ro_uri(db_path), uri=True) as db:
         row = await (await db.execute(sql, (channel_id,))).fetchone()
     return _row_to_channel(row) if row else None
+
+
+async def channel_attribution(db_path: str, channel_id: int) -> dict | None:
+    """Поля канала twidgest для подписи «Собрано @бот»: владелец, оплата, триал, режим.
+    attribution_mode = None, пока миграция twidgest колонку не добавила (= авто)."""
+    async with aiosqlite.connect(_ro_uri(db_path), uri=True) as db:
+        has = await _has_column(db, "channels", "attribution_mode")
+        cols = "user_id, paid_until, trial_until" + (", attribution_mode" if has else "")
+        row = await (await db.execute(
+            f"SELECT {cols} FROM channels WHERE id = ? LIMIT 1", (channel_id,))).fetchone()
+    if not row:
+        return None
+    return {"user_id": row[0], "paid_until": row[1], "trial_until": row[2],
+            "attribution_mode": row[3] if has else None}
